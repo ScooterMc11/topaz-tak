@@ -168,7 +168,6 @@ impl SmartMoveBuffer {
                 dest = board.index(step.index);
                 let covered = dest.top();
                 let covering = stack_data[offset];
-                let bit_idx = 1 << step.index;
                 if let Some(piece) = covered {
                     if piece.owner() == active_side {
                         if piece.is_flat() {
@@ -308,8 +307,16 @@ impl SmartMoveBuffer {
                         0,
                     ));
                 }
+                // "Black stack setup": White's first move places a stack of two (swapped)
+                // black flats, encoded as a flat placement with number()==2. Caps and walls
+                // are already excluded at move_num==1 by the ply() >= 4 guards above.
+                let flat_move = if board.move_num() == 1 && side == Color::White {
+                    GameMove::from_placement(Piece::flat(side), idx).set_number(2)
+                } else {
+                    GameMove::from_placement(Piece::flat(side), idx)
+                };
                 self.moves.push(ScoredMove::new(
-                    GameMove::from_placement(Piece::flat(side), idx),
+                    flat_move,
                     flat_score + tak_score,
                     TAK_SORT != 0,
                     1,

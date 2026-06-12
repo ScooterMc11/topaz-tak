@@ -4,10 +4,16 @@ use anyhow::{anyhow, ensure, Result};
 pub use board::{Bitboard, BitboardStorage, Piece, Stack, TakBoard};
 pub use move_gen::{generate_all_moves, GameMove, RevGameMove};
 
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod balance;
 pub mod board;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod datagen;
 #[cfg(feature = "evaluation")]
 pub mod eval;
 pub mod move_gen;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod openings;
 pub mod proof;
 #[cfg(feature = "evaluation")]
 pub mod search;
