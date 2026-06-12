@@ -73,7 +73,7 @@ pub fn main() {
                         // let mut eval = eval::SmoothWeights6::empty();
                         // let mut eval = eval::PST6::default();
                         // dbg!(&eval);
-                        let mut board = board.with_komi(4);
+                        let mut board = board.with_komi(0);
                         let score0 = eval.evaluate(&mut board, 0);
                         // board.null_move();
                         // let null_move_score = eval.evaluate(&mut board, 100);
@@ -107,7 +107,7 @@ pub fn main() {
                     .write(true)
                     .open("analysis.ptn")
                     .unwrap();
-                let mut board = Board6::new().with_komi(4);
+                let mut board = Board6::new().with_komi(0);
                 let mut active_player = Color::White;
                 let mut info = SearchInfo::new(20, &table).time_bank(TimeBank::flat(MILLIS));
                 // let mut eval = eval::Weights6::default();
@@ -219,7 +219,7 @@ pub fn main() {
                     }
                     TakGame::Standard6(ref mut board) => {
                         // let mut eval = Weights6::default();
-                        let mut eval_board = board.clone().with_komi(4);
+                        let mut eval_board = board.clone().with_komi(0);
                         let mut eval = NNUE6::default();
                         let outcome = search(&mut eval_board, &mut eval, &mut info).unwrap();
                         println!("{}", outcome.best_move().unwrap());
@@ -333,6 +333,123 @@ pub fn main() {
             let (s2, r2) = unbounded();
             playtak_loop(s1, r2);
             play_game_playtak(s2, r1).unwrap();
+            return;
+        } else if arg1 == "datagen" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Search node cap per move (default 5000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 6)", "N");
+            opts.optopt("o", "output", "Output .bin path (default data.bin)", "PATH");
+            opts.optopt("s", "ttsize", "TT entries per thread (default 1048576)", "N");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz datagen [options]"));
+                return;
+            }
+            let default = topaz_tak::datagen::DataGenConfig::default();
+            let cfg = topaz_tak::datagen::DataGenConfig {
+                num_games: matches.opt_get_default("g", default.num_games).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                output: matches.opt_str("o").unwrap_or(default.output),
+                tt_size: matches.opt_get_default("s", default.tt_size).unwrap(),
+            };
+            topaz_tak::datagen::run(cfg).expect("datagen failed");
+            return;
+        } else if arg1 == "checkdata" {
+            let path = args.get(2).expect("usage: topaz checkdata <path.bin>");
+            println!(
+                "{}",
+                topaz_tak::datagen::summarize_file(path).expect("could not read data file")
+            );
+            return;
+        } else if arg1 == "trimdata" {
+            let path = args.get(2).expect("usage: topaz trimdata <path.bin>");
+            println!(
+                "{}",
+                topaz_tak::datagen::trim_file(path).expect("could not process data file")
+            );
+            return;
+        } else if arg1 == "balance" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 20000)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Search node cap per move (default 15000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 3)", "N");
+            opts.optflag("c", "corner", "Force White's opening stack onto a random corner");
+            opts.optopt("b", "book", "TPS opening book; play each position once (overrides -r/-g/-c)", "PATH");
+            opts.optopt("k", "komi", "Half-komi added to Black (default 0; 4 = 2 komi)", "N");
+            opts.optopt("o", "ptnout", "Write each played game as PTN here (forces 1 thread; use a small book)", "PATH");
+            opts.optflag("a", "archetypes", "Generate the black-stack book internally and break results down by opening archetype");
+            opts.optflag("s", "standard", "With --archetypes: generate standard (2-komi) openings instead of black-stack");
+            opts.optopt("w", "weights", "With --archetypes: comma-separated per-archetype weights (5 for black-stack, 3 for standard)", "W,W,..");
+            opts.optopt("l", "ptn-limit", "With --ptnout: record PTN for only the first N games", "N");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz balance [options]"));
+                return;
+            }
+            let d = topaz_tak::balance::BalanceConfig::default();
+            let cfg = topaz_tak::balance::BalanceConfig {
+                num_games: matches.opt_get_default("g", d.num_games).unwrap(),
+                threads: matches.opt_get_default("t", d.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", d.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", d.random_plies).unwrap(),
+                corner_open: matches.opt_present("corner"),
+                book_path: matches.opt_str("b"),
+                komi: matches.opt_get_default("k", d.komi).unwrap(),
+                ptnout: matches.opt_str("o"),
+                archetype_breakdown: matches.opt_present("archetypes"),
+                standard_book: matches.opt_present("standard"),
+                archetype_weights: matches.opt_str("w").map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().parse::<f64>().expect("invalid --weights value"))
+                        .collect()
+                }),
+                ptn_limit: matches.opt_get_default("l", usize::MAX).unwrap(),
+                tt_size: d.tt_size,
+            };
+            topaz_tak::balance::run(cfg);
+            return;
+        } else if arg1 == "openings" {
+            let mut opts = Options::new();
+            opts.optopt("n", "count", "Number of unique openings (default 1000)", "N");
+            opts.optopt("t", "tps", "Output TPS book path", "PATH");
+            opts.optopt("p", "ptn", "Output PTN book path", "PATH");
+            opts.optflag("s", "standard", "Standard-Tak book (single-flat ply 1; diagonal/adjacent/hug archetypes; for the 2-komi comparison)");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz openings [options]"));
+                return;
+            }
+            let d = topaz_tak::openings::OpeningsConfig::default();
+            let cfg = topaz_tak::openings::OpeningsConfig {
+                count: matches.opt_get_default("n", d.count).unwrap(),
+                tps_path: matches.opt_str("t").unwrap_or(d.tps_path),
+                ptn_path: matches.opt_str("p").unwrap_or(d.ptn_path),
+                standard: matches.opt_present("standard"),
+            };
+            topaz_tak::openings::run(cfg).expect("openings failed");
             return;
         } else {
             println!("Unknown argument: {}", arg1);
@@ -768,7 +885,9 @@ fn tei_loop() {
 // println!("option name ASP type spin default 55 min 45 max 80");
 // println!("option name Quiet type spin default 40 min -10 max 70");
 
-const PLAYTAK_KOMI: u8 = 4;
+// "Black stack setup" experiment: first-player advantage is offset by White's opening
+// double-black-stack placement rather than komi, so komi is 0.
+const PLAYTAK_KOMI: u8 = 0;
 
 fn play_game_playtak(server_send: Sender<String>, server_recv: Receiver<TeiCommand>) -> Result<()> {
     const MAX_DEPTH: usize = 32;

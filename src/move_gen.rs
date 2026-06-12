@@ -63,13 +63,23 @@ pub fn generate_all_place_moves<T: TakBoard, B: MoveBuffer>(board: &T, moves: &m
     let side_to_move = board.side_to_move();
     let start_locs = board.empty_tiles();
     if board.move_num() == 1 {
-        // Force flats. Handle swapping of the pieces in the do_move function
-        let piece = match side_to_move {
-            Color::White => Piece::WhiteFlat,
-            Color::Black => Piece::BlackFlat,
-        };
-        for index in start_locs {
-            moves.add_move(GameMove::from_placement(piece, index));
+        // Force flats. Handle swapping of the pieces in the do_move function.
+        // "Black stack setup": White's first move places a stack of two (swapped) black
+        // flats, encoded as a flat placement with number()==2. Black's first move is the
+        // standard single swapped flat.
+        match side_to_move {
+            Color::White => {
+                for index in start_locs {
+                    moves.add_move(
+                        GameMove::from_placement(Piece::WhiteFlat, index).set_number(2),
+                    );
+                }
+            }
+            Color::Black => {
+                for index in start_locs {
+                    moves.add_move(GameMove::from_placement(Piece::BlackFlat, index));
+                }
+            }
         }
         return;
     }

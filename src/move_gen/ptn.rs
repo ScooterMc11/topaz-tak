@@ -10,6 +10,8 @@ impl GameMove {
             match self.place_piece() {
                 Piece::WhiteCap | Piece::BlackCap => return format!("C{}", square),
                 Piece::WhiteWall | Piece::BlackWall => return format!("S{}", square),
+                // "Black stack setup": the first-move double flat placement prints as "2<square>".
+                _ if self.number() == 2 => return format!("2{}", square),
                 _ => return square,
             }
         }
@@ -197,6 +199,15 @@ impl GameMove {
         } else {
             // Placement
             let color = active_player;
+            // "Black stack setup": "2<square>" (a leading count, no direction) is the
+            // first-move double flat placement, encoded with number()==2.
+            if let Some(count) = pieces {
+                if count == 2 && first != 'S' && first != 'C' {
+                    return Some(Self::from_placement(Piece::flat(color), square).set_number(2));
+                }
+                // Any other leading count with no direction is not a legal placement.
+                return None;
+            }
             let piece = if first == 'S' {
                 Piece::wall(color)
             } else if first == 'C' {
@@ -259,6 +270,43 @@ mod test {
             let m = GameMove::try_from_ptn(p, &board).unwrap();
             assert_eq!(p, &m.to_ptn::<Board6>())
         }
+    }
+    #[test]
+    pub fn black_stack_setup_ptn() {
+        // "2a1" parses to a first-move double flat placement (number()==2) and round-trips.
+        let m = GameMove::try_from_ptn_m("2a1", 6, Color::White).unwrap();
+        assert!(m.is_place_move());
+        assert!(!m.is_stack_move());
+        assert_eq!(m.number(), 2);
+        assert_eq!(m.place_piece(), Piece::WhiteFlat);
+        assert_eq!(m.to_ptn::<Board6>(), "2a1");
+        // A leading count other than 2 with no direction is not a legal placement.
+        assert!(GameMove::try_from_ptn_m("3a1", 6, Color::White).is_none());
+        // "2Ca1" / "2Sa1" (count + blocker) is rejected.
+        assert!(GameMove::try_from_ptn_m("2Ca1", 6, Color::White).is_none());
+    }
+    #[test]
+    pub fn black_stack_setup_do_reverse() {
+        use crate::Position;
+        let mut board = Board6::new();
+        let flats = board.pieces_reserve(Color::White);
+        // Every White first move is a double placement (number()==2); no single flat appears.
+        let mut moves: Vec<GameMove> = Vec::new();
+        generate_all_moves(&board, &mut moves);
+        assert!(!moves.is_empty());
+        assert!(moves.iter().all(|m| m.is_place_move() && m.number() == 2));
+        // Apply one and check reserves / stack, then reverse.
+        let mv = GameMove::try_from_ptn_m("2d3", 6, Color::White).unwrap();
+        let rev = board.do_move(mv);
+        let idx = mv.src_index();
+        assert_eq!(board.pieces_reserve(Color::Black), flats - 2);
+        assert_eq!(board.pieces_reserve(Color::White), flats);
+        assert_eq!(board.board[idx].len(), 2);
+        assert_eq!(board.board[idx].top(), Some(Piece::BlackFlat));
+        board.reverse_move(rev);
+        assert_eq!(board.pieces_reserve(Color::Black), flats);
+        assert_eq!(board.pieces_reserve(Color::White), flats);
+        assert!(board.board[idx].is_empty());
     }
     #[test]
     pub fn playtak_move() {

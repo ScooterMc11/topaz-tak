@@ -160,6 +160,10 @@ macro_rules! board_impl {
                     if !p.is_cap() && self.pieces_reserve(self.side_to_move()) == 0 {
                         return false;
                     }
+                    // "Black stack setup": the double placement spends two flats from Black's reserve.
+                    if !p.is_cap() && game_move.number() == 2 && self.pieces_reserve(Color::Black) < 2 {
+                        return false;
+                    }
                     (self.bits().empty() & <$bits>::index_to_bit(game_move.src_index())).nonzero()
                 } else {
                     crate::move_gen::legal_stack_move(self, game_move)
@@ -549,11 +553,18 @@ macro_rules! board_impl {
                 let m = rev_m.game_move;
                 let src_index = m.src_index();
                 if m.is_place_move() {
-                    let piece = self.board[src_index].pop(&mut self.bits).unwrap();
-                    if piece.is_cap() {
-                        self.caps_left[piece.owner() as usize] += 1;
+                    if m.number() == 2 {
+                        // "Black stack setup": undo White's first-move double placement.
+                        let piece = self.board[src_index].pop(&mut self.bits).unwrap();
+                        self.board[src_index].pop(&mut self.bits).unwrap();
+                        self.flats_left[piece.owner() as usize] += 2;
                     } else {
-                        self.flats_left[piece.owner() as usize] += 1;
+                        let piece = self.board[src_index].pop(&mut self.bits).unwrap();
+                        if piece.is_cap() {
+                            self.caps_left[piece.owner() as usize] += 1;
+                        } else {
+                            self.flats_left[piece.owner() as usize] += 1;
+                        }
                     }
                 } else {
                     let iter = rev_m.game_move.quantity_iter(Self::SIZE);
@@ -589,11 +600,19 @@ macro_rules! board_impl {
                     if swap_pieces {
                         piece = piece.swap_color();
                     }
-                    self.board[src_index].push(piece, &mut self.bits);
-                    if piece.is_cap() {
-                        self.caps_left[piece.owner() as usize] -= 1;
+                    // "Black stack setup": White's first move places two swapped (black)
+                    // flats as a single stack, drawn from Black's reserve.
+                    if swap_pieces && m.number() == 2 {
+                        self.board[src_index].push(piece, &mut self.bits);
+                        self.board[src_index].push(piece, &mut self.bits);
+                        self.flats_left[piece.owner() as usize] -= 2;
                     } else {
-                        self.flats_left[piece.owner() as usize] -= 1;
+                        self.board[src_index].push(piece, &mut self.bits);
+                        if piece.is_cap() {
+                            self.caps_left[piece.owner() as usize] -= 1;
+                        } else {
+                            self.flats_left[piece.owner() as usize] -= 1;
+                        }
                     }
                     RevGameMove::new(m, src_index, curr_fifty_move)
                 } else {
@@ -776,6 +795,26 @@ impl Board6 {
         let idx = rng.next_u32() as usize % moves.len();
         self.do_move(moves[idx]);
     }
+
+    /// Like [`do_random_move`](Self::do_random_move), but only considers **flat placements** (no
+    /// walls, caps, or stack moves). Used to diversify opening plies without injecting unusual
+    /// wall/cap opening moves. The forced `2xx` double-black-stack placement is itself a flat
+    /// placement, so it is preserved. Falls back to any legal move if no flat placement exists.
+    #[cfg(feature = "random")]
+    pub fn do_random_flat_move<R: rand_core::RngCore>(&mut self, rng: &mut R) {
+        let mut moves: Vec<GameMove> = Vec::new();
+        generate_all_moves(self, &mut moves);
+        let flats: Vec<GameMove> = moves
+            .iter()
+            .copied()
+            .filter(|m| {
+                m.is_place_move() && matches!(m.place_piece(), Piece::WhiteFlat | Piece::BlackFlat)
+            })
+            .collect();
+        let pool = if flats.is_empty() { &moves } else { &flats };
+        let idx = rng.next_u32() as usize % pool.len();
+        self.do_move(pool[idx]);
+    }
 }
 
 #[cfg(test)]
@@ -907,13 +946,13 @@ mod test {
     }
     #[test]
     pub fn basic_perft() {
-        let ptn_moves = &[
-            "c2", "c3", "d3", "b3", "c4", "1c2+", "1d3<", "1b3>", "1c4-", "Cc2", "a1", "1c2+", "a2",
-        ];
-        let mut board = Board6::new();
-        let res = crate::execute_moves_check_valid(&mut board, ptn_moves);
-        assert!(res.is_ok());
-
+        // Perft depends only on the final position, so we load it directly from TPS. This
+        // avoids replaying a standard opening, which the "black stack setup" rule no longer
+        // permits (White's first move must be a double placement). This is the same position
+        // the test previously reached via the moves c2 c3 d3 b3 c4 1c2+ 1d3< 1b3> 1c4- Cc2
+        // a1 1c2+ a2, so the validated node counts are unchanged.
+        let tps = "x6/x6/x6/x2,121212C,x3/1,x5/1,x5 2 7";
+        let mut board = Board6::try_from_tps(tps).unwrap();
         let p_res: Vec<_> = (0..3)
             .map(|depth| crate::perft(&mut board, depth as u16))
             .collect();
