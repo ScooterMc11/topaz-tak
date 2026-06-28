@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Instant;
 use telnet::Event;
 use topaz_tak::board::{Board5, Board6};
-use topaz_tak::eval::{Evaluator, Weights5, Weights6, NNUE6};
+use topaz_tak::eval::{Evaluator, Weights6, NNUE4, NNUE5, NNUE6};
 use topaz_tak::proof::TinueSearch;
-use topaz_tak::search::{book, search, SearchHyper, SearchInfo};
+use topaz_tak::search::{search, SearchInfo};
 use topaz_tak::transposition_table::HashTable;
 use topaz_tak::*;
 const TUNING: bool = false;
@@ -64,7 +64,7 @@ pub fn main() {
                 let mut info = SearchInfo::new(32, &table);
                 match game {
                     TakGame::Standard5(mut board) => {
-                        let mut eval = Weights5::default();
+                        let mut eval = NNUE5::default();
                         search(&mut board, &mut eval, &mut info);
                     }
                     TakGame::Standard6(board) => {
@@ -207,7 +207,7 @@ pub fn main() {
             while game.game_result().is_none() {
                 match game {
                     TakGame::Standard5(ref mut board) => {
-                        let mut eval = Weights5::default();
+                        let mut eval = NNUE5::default();
                         let outcome = search(board, &mut eval, &mut info).unwrap();
                         println!("{}", outcome.best_move().unwrap());
                         let mv = outcome.next().unwrap();
@@ -329,10 +329,19 @@ pub fn main() {
             }
             return;
         } else if arg1 == "playtak" {
+            let config = PlaytakConfig::from_env();
+            println!("PlayTak config: {:?}", config);
             let (s1, r1) = unbounded();
             let (s2, r2) = unbounded();
-            playtak_loop(s1, r2);
-            play_game_playtak(s2, r1).unwrap();
+            playtak_loop(s1, r2, config.clone());
+            let res = match config.size {
+                5 => play_game_playtak::<NNUE5>(s2, r1, config),
+                6 => play_game_playtak::<NNUE6>(s2, r1, config),
+                n => panic!("Unsupported PLAYTAK_SIZE {} (only 5 or 6 supported)", n),
+            };
+            if let Err(e) = res {
+                eprintln!("playtak engine loop ended: {}", e);
+            }
             return;
         } else if arg1 == "datagen" {
             let mut opts = Options::new();
@@ -364,6 +373,150 @@ pub fn main() {
             };
             topaz_tak::datagen::run(cfg).expect("datagen failed");
             return;
+        } else if arg1 == "datagen5" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
+            opts.optopt("t", "threads", "Worker threads, one tiltak each (default 4)", "N");
+            opts.optopt("n", "nodes", "tiltak go-nodes per move (default 10000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 6)", "N");
+            opts.optopt("k", "komi", "Half-komi for tiltak (default 0)", "N");
+            opts.optopt("p", "plycap", "Max plies before scoring a draw (default 120)", "N");
+            opts.optopt("e", "engine", "Path to tiltak tei binary", "PATH");
+            opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optopt("o", "output", "Output .bin path (default data5.bin)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz datagen5 [options]"));
+                return;
+            }
+            let default = topaz_tak::datagen5::DataGen5Config::default();
+            let cfg = topaz_tak::datagen5::DataGen5Config {
+                num_games: matches.opt_get_default("g", default.num_games).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
+                max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
+                tiltak_path: matches.opt_str("e").unwrap_or(default.tiltak_path),
+                book_path: matches.opt_str("b"),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::datagen5::run(cfg).expect("datagen5 failed");
+            return;
+        } else if arg1 == "datagen5self" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Topaz search node cap per move (default 5000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 6)", "N");
+            opts.optopt("k", "komi", "Half-komi written to entries (default 0)", "N");
+            opts.optopt("p", "plycap", "Max plies before scoring a draw (default 120)", "N");
+            opts.optopt("s", "ttsize", "TT entries per thread (default 1048576)", "N");
+            opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optopt("o", "output", "Output .bin path (default data5_self.bin)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz datagen5self [options]"));
+                return;
+            }
+            let default = topaz_tak::datagen5::SelfPlay5Config::default();
+            let cfg = topaz_tak::datagen5::SelfPlay5Config {
+                num_games: matches.opt_get_default("g", default.num_games).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
+                max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
+                tt_size: matches.opt_get_default("s", default.tt_size).unwrap(),
+                book_path: matches.opt_str("b"),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::datagen5::run_selfplay(cfg).expect("datagen5self failed");
+            return;
+        } else if arg1 == "datagen4" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
+            opts.optopt("t", "threads", "Worker threads, one tiltak each (default 4)", "N");
+            opts.optopt("n", "nodes", "tiltak go-nodes per move (default 10000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 4)", "N");
+            opts.optopt("k", "komi", "Half-komi for tiltak (default 0)", "N");
+            opts.optopt("p", "plycap", "Max plies before scoring a draw (default 60)", "N");
+            opts.optopt("e", "engine", "Path to tiltak tei binary", "PATH");
+            opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optopt("o", "output", "Output .bin path (default data4.bin)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz datagen4 [options]"));
+                return;
+            }
+            let default = topaz_tak::datagen4::DataGen4Config::default();
+            let cfg = topaz_tak::datagen4::DataGen4Config {
+                num_games: matches.opt_get_default("g", default.num_games).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
+                max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
+                tiltak_path: matches.opt_str("e").unwrap_or(default.tiltak_path),
+                book_path: matches.opt_str("b"),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::datagen4::run(cfg).expect("datagen4 failed");
+            return;
+        } else if arg1 == "datagen4self" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Topaz search node cap per move (default 5000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 4)", "N");
+            opts.optopt("k", "komi", "Half-komi written to entries (default 0)", "N");
+            opts.optopt("p", "plycap", "Max plies before scoring a draw (default 60)", "N");
+            opts.optopt("s", "ttsize", "TT entries per thread (default 1048576)", "N");
+            opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optopt("o", "output", "Output .bin path (default data4_self.bin)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz datagen4self [options]"));
+                return;
+            }
+            let default = topaz_tak::datagen4::SelfPlay4Config::default();
+            let cfg = topaz_tak::datagen4::SelfPlay4Config {
+                num_games: matches.opt_get_default("g", default.num_games).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
+                max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
+                tt_size: matches.opt_get_default("s", default.tt_size).unwrap(),
+                book_path: matches.opt_str("b"),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::datagen4::run_selfplay(cfg).expect("datagen4self failed");
+            return;
         } else if arg1 == "checkdata" {
             let path = args.get(2).expect("usage: topaz checkdata <path.bin>");
             println!(
@@ -392,6 +545,8 @@ pub fn main() {
             opts.optflag("s", "standard", "With --archetypes: generate standard (2-komi) openings instead of black-stack");
             opts.optopt("w", "weights", "With --archetypes: comma-separated per-archetype weights (5 for black-stack, 3 for standard)", "W,W,..");
             opts.optopt("l", "ptn-limit", "With --ptnout: record PTN for only the first N games", "N");
+            opts.optopt("e", "tiltak", "Drive this tiltak TEI binary (self-play) instead of the net; cross-check 6x6 balance (use with -a/--book)", "PATH");
+            opts.optopt("p", "plycap", "Max plies before a draw in tiltak mode (default 200)", "N");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
                 Ok(m) => m,
@@ -422,8 +577,112 @@ pub fn main() {
                 }),
                 ptn_limit: matches.opt_get_default("l", usize::MAX).unwrap(),
                 tt_size: d.tt_size,
+                tiltak_path: matches.opt_str("e"),
+                max_plies: matches.opt_get_default("p", d.max_plies).unwrap(),
             };
             topaz_tak::balance::run(cfg);
+            return;
+        } else if arg1 == "balance5" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 20000)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Search node cap per move (default 15000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 4)", "N");
+            opts.optflag("c", "corner", "Force White's opening stack onto a random corner");
+            opts.optopt("b", "book", "TPS opening book; play each position once (overrides -r/-g/-c)", "PATH");
+            opts.optopt("k", "komi", "Half-komi added to Black (default 0)", "N");
+            opts.optopt("o", "ptnout", "Write each played game as PTN here (forces 1 thread; use a small book)", "PATH");
+            opts.optflag("a", "archetypes", "Generate the book internally and break results down by opening archetype");
+            opts.optflag("s", "standard", "With --archetypes: generate standard openings instead of black-stack");
+            opts.optopt("w", "weights", "With --archetypes: comma-separated per-archetype weights (5 black-stack, 3 standard)", "W,W,..");
+            opts.optopt("l", "ptn-limit", "With --ptnout: record PTN for only the first N games", "N");
+            opts.optopt("e", "tiltak", "Drive this tiltak TEI binary (self-play) instead of the net; cross-check standard balance (use with -a/--book)", "PATH");
+            opts.optopt("p", "plycap", "Max plies before a draw in tiltak mode (default 200)", "N");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz balance5 [options]"));
+                return;
+            }
+            let d = topaz_tak::balance5::BalanceConfig::default();
+            let cfg = topaz_tak::balance5::BalanceConfig {
+                num_games: matches.opt_get_default("g", d.num_games).unwrap(),
+                threads: matches.opt_get_default("t", d.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", d.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", d.random_plies).unwrap(),
+                corner_open: matches.opt_present("corner"),
+                book_path: matches.opt_str("b"),
+                komi: matches.opt_get_default("k", d.komi).unwrap(),
+                ptnout: matches.opt_str("o"),
+                archetype_breakdown: matches.opt_present("archetypes"),
+                standard_book: matches.opt_present("standard"),
+                archetype_weights: matches.opt_str("w").map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().parse::<f64>().expect("invalid --weights value"))
+                        .collect()
+                }),
+                ptn_limit: matches.opt_get_default("l", usize::MAX).unwrap(),
+                tt_size: d.tt_size,
+                tiltak_path: matches.opt_str("e"),
+                max_plies: matches.opt_get_default("p", d.max_plies).unwrap(),
+            };
+            topaz_tak::balance5::run(cfg);
+            return;
+        } else if arg1 == "balance4" {
+            let mut opts = Options::new();
+            opts.optopt("g", "games", "Number of self-play games (default 20000; capped at distinct openings for -a/--book)", "N");
+            opts.optopt("t", "threads", "Worker threads (default 4)", "N");
+            opts.optopt("n", "nodes", "Search node cap per move (default 15000)", "N");
+            opts.optopt("r", "random", "Random opening plies (default 4)", "N");
+            opts.optflag("c", "corner", "Force White's opening stack onto a random corner");
+            opts.optopt("b", "book", "TPS opening book; play each position once (overrides -r/-g/-c)", "PATH");
+            opts.optopt("k", "komi", "Half-komi added to Black (default 0)", "N");
+            opts.optopt("o", "ptnout", "Write each played game as PTN here (forces 1 thread; use a small book)", "PATH");
+            opts.optflag("a", "archetypes", "Generate the book internally and break results down by opening archetype");
+            opts.optflag("s", "standard", "With --archetypes: generate standard openings instead of black-stack");
+            opts.optopt("w", "weights", "With --archetypes: comma-separated per-archetype weights (4 black-stack, 3 standard)", "W,W,..");
+            opts.optopt("l", "ptn-limit", "With --ptnout: record PTN for only the first N games", "N");
+            opts.optopt("e", "tiltak", "Drive this tiltak TEI binary (self-play) instead of the net; cross-check standard balance (use with -a/--book)", "PATH");
+            opts.optopt("p", "plycap", "Max plies before a draw in tiltak mode (default 120)", "N");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz balance4 [options]"));
+                return;
+            }
+            let d = topaz_tak::balance4::BalanceConfig::default();
+            let cfg = topaz_tak::balance4::BalanceConfig {
+                num_games: matches.opt_get_default("g", d.num_games).unwrap(),
+                threads: matches.opt_get_default("t", d.threads).unwrap(),
+                max_nodes: matches.opt_get_default("n", d.max_nodes).unwrap(),
+                random_plies: matches.opt_get_default("r", d.random_plies).unwrap(),
+                corner_open: matches.opt_present("corner"),
+                book_path: matches.opt_str("b"),
+                komi: matches.opt_get_default("k", d.komi).unwrap(),
+                ptnout: matches.opt_str("o"),
+                archetype_breakdown: matches.opt_present("archetypes"),
+                standard_book: matches.opt_present("standard"),
+                archetype_weights: matches.opt_str("w").map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().parse::<f64>().expect("invalid --weights value"))
+                        .collect()
+                }),
+                ptn_limit: matches.opt_get_default("l", usize::MAX).unwrap(),
+                tt_size: d.tt_size,
+                tiltak_path: matches.opt_str("e"),
+                max_plies: matches.opt_get_default("p", d.max_plies).unwrap(),
+            };
+            topaz_tak::balance4::run(cfg);
             return;
         } else if arg1 == "openings" {
             let mut opts = Options::new();
@@ -450,6 +709,58 @@ pub fn main() {
                 standard: matches.opt_present("standard"),
             };
             topaz_tak::openings::run(cfg).expect("openings failed");
+            return;
+        } else if arg1 == "openings5" {
+            let mut opts = Options::new();
+            opts.optopt("n", "count", "Number of unique openings (default 1000)", "N");
+            opts.optopt("t", "tps", "Output TPS book path", "PATH");
+            opts.optopt("p", "ptn", "Output PTN book path", "PATH");
+            opts.optflag("s", "standard", "Standard-Tak book (single-flat ply 1; diagonal/adjacent/hug archetypes)");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz openings5 [options]"));
+                return;
+            }
+            let d = topaz_tak::openings5::OpeningsConfig::default();
+            let cfg = topaz_tak::openings5::OpeningsConfig {
+                count: matches.opt_get_default("n", d.count).unwrap(),
+                tps_path: matches.opt_str("t").unwrap_or(d.tps_path),
+                ptn_path: matches.opt_str("p").unwrap_or(d.ptn_path),
+                standard: matches.opt_present("standard"),
+            };
+            topaz_tak::openings5::run(cfg).expect("openings5 failed");
+            return;
+        } else if arg1 == "openings4" {
+            let mut opts = Options::new();
+            opts.optopt("n", "count", "Number of unique openings (default 207 = the ceiling)", "N");
+            opts.optopt("t", "tps", "Output TPS book path", "PATH");
+            opts.optopt("p", "ptn", "Output PTN book path", "PATH");
+            opts.optflag("s", "standard", "Standard-Tak book (single-flat ply 1; diagonal/adjacent/hug archetypes)");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz openings4 [options]"));
+                return;
+            }
+            let d = topaz_tak::openings4::OpeningsConfig::default();
+            let cfg = topaz_tak::openings4::OpeningsConfig {
+                count: matches.opt_get_default("n", d.count).unwrap(),
+                tps_path: matches.opt_str("t").unwrap_or(d.tps_path),
+                ptn_path: matches.opt_str("p").unwrap_or(d.ptn_path),
+                standard: matches.opt_present("standard"),
+            };
+            topaz_tak::openings4::run(cfg).expect("openings4 failed");
             return;
         } else {
             println!("Unknown argument: {}", arg1);
@@ -696,7 +1007,8 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                 }
                 info = info
                     .set_multi_pv(init.multi_pv)
-                    .with_hyper(init.hyper.clone());
+                    .with_hyper(init.hyper.clone())
+                    .abort_depth(init.early_abort_depth);
                 info = info.input_stream(receiver.clone());
                 if let Some(mv_time) = go.movetime {
                     info = info.time_bank(TimeBank::flat(mv_time));
@@ -706,7 +1018,7 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                     let time_left = TimeLeft::new(&go);
                     let (clock_time, clock_inc) = time_left.has_time(board.side_to_move());
                     let use_time = TimeBank::init(flats_left as u64, clock_time, clock_inc);
-                    info = info.time_bank(use_time).abort_depth(8);
+                    info = info.time_bank(use_time).abort_depth(init.early_abort_depth);
                 } else {
                     info = info.time_bank(TimeBank::flat(1_000_000_000)) // Go infinite
                 }
@@ -788,6 +1100,7 @@ fn identify() {
     println!("option name Threads type spin default 1 min 1 max 8");
     println!("option name Hash type spin default 8 min 1 max 1024");
     println!("option name MaxNodes type spin default -1 min -1 max 10000000");
+    println!("option name AbortDepth type spin default 6 min 1 max 64");
     println!("option name MultiPV type spin default 1 min 1 max 8");
     if TUNING {
         println!("option name RFP type spin default 115 min 50 max 150");
@@ -835,7 +1148,8 @@ fn tei_loop() {
             if let Some(recv) = receiver.take() {
                 let init = init.clone();
                 thread::spawn(move || match size {
-                    5 => play_game_tei::<Weights5>(recv, init).unwrap(),
+                    4 => play_game_tei::<NNUE4>(recv, init).unwrap(),
+                    5 => play_game_tei::<NNUE5>(recv, init).unwrap(),
                     6 => play_game_tei::<NNUE6>(recv, init).unwrap(),
                     // 6 => play_game_tei::<Weights6>(recv, init).unwrap(),
                     _ => unimplemented!(),
@@ -855,6 +1169,9 @@ fn tei_loop() {
             } else if name == "MaxNodes" {
                 init.max_nodes = value.parse().unwrap();
                 println!("Setting MaxNodes to {}", init.max_nodes);
+            } else if name == "AbortDepth" {
+                init.early_abort_depth = value.parse().unwrap();
+                println!("Setting AbortDepth to {}", init.early_abort_depth);
             } else if name == "Hash" {
                 init.hash_size = 1024 * 1024 * value.parse::<usize>().unwrap();
                 println!("Setting Hash to {}", init.hash_size);
@@ -889,49 +1206,167 @@ fn tei_loop() {
 // double-black-stack placement rather than komi, so komi is 0.
 const PLAYTAK_KOMI: u8 = 0;
 
-fn play_game_playtak(server_send: Sender<String>, server_recv: Receiver<TeiCommand>) -> Result<()> {
+/// Env-driven configuration for the PlayTak telnet client (see gembot-deployment-plan.md §4.1).
+/// One binary, launched once per bot, fully driven by these vars. Defaults target the local
+/// DBS fork (`localhost:10000`, Double Black Stack, 3+n increment scaling, rated).
+#[derive(Clone, Debug)]
+struct PlaytakConfig {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    size: usize,
+    pieces: u32,
+    caps: u32,
+    time: u32,
+    inc: u32,
+    inc_scales: u8,
+    opening: u8,
+    color: String,
+    unrated: u8,
+    komi: u8,
+    /// Node cap per move (the strength knob; see §4.5/§8). 0 disables the cap.
+    nodes: u64,
+    /// Iterative-deepening depth below which the node/time cap is not honored. Low (e.g. 1-2) lets
+    /// small `nodes` caps actually bite; the engine default 6 imposes a ~4k-node floor.
+    abort_depth: usize,
+    /// Transposition-table size in MB.
+    hash_mb: usize,
+    /// Black's first-reply archetype weights (diagonal, adjacent, hug, gap-hug); see §4.7.
+    black_opening_weights: Vec<f64>,
+}
+
+impl PlaytakConfig {
+    fn from_env() -> Self {
+        dotenv::dotenv().ok();
+        let get = |k: &str| env::var(k).ok();
+        let size = get("PLAYTAK_SIZE")
+            .and_then(|x| x.trim().parse().ok())
+            .unwrap_or(6);
+        // Standard per-size reserves (flats / capstones).
+        let (pieces, caps) = match size {
+            5 => (21, 1),
+            6 => (30, 1),
+            _ => (30, 1),
+        };
+        Self {
+            host: get("PLAYTAK_HOST").unwrap_or_else(|| "localhost".to_string()),
+            port: get("PLAYTAK_PORT")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(10_000),
+            username: get("PLAYTAK_USERNAME"),
+            password: get("PLAYTAK_PASSWORD"),
+            size,
+            pieces,
+            caps,
+            time: get("PLAYTAK_TIME")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(180),
+            inc: get("PLAYTAK_INC")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(1),
+            inc_scales: get("PLAYTAK_INC_SCALES")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(1),
+            opening: get("PLAYTAK_OPENING")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(1),
+            color: get("PLAYTAK_COLOR").unwrap_or_else(|| "A".to_string()),
+            unrated: get("PLAYTAK_UNRATED")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
+            komi: get("PLAYTAK_KOMI")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(PLAYTAK_KOMI),
+            nodes: get("PLAYTAK_NODES")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(10_000),
+            abort_depth: get("PLAYTAK_ABORT_DEPTH")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(2),
+            hash_mb: get("PLAYTAK_HASH_MB")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(128),
+            black_opening_weights: get("PLAYTAK_BLACK_OPENING_WEIGHTS")
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|x| x.trim().parse::<f64>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| v.len() == 4)
+                .unwrap_or_else(|| vec![20.0, 25.0, 30.0, 25.0]),
+        }
+    }
+
+    /// Build the fork's protocol-4 (seekV4) seek command. Field order (server `Client.java`):
+    /// `Seek size time incr incScales color komi pieces caps unrated tournament trigger
+    /// timeAmount opening [opponent]`. `opening = 1` => Double Black Stack; `unrated = 0` => rated;
+    /// `inc_scales = 1` with `inc = 1` => "3 + n" (award `1s x moveNum` each move).
+    fn seek_string(&self) -> String {
+        format!(
+            "Seek {} {} {} {} {} {} {} {} {} 0 0 0 {} \n",
+            self.size,
+            self.time,
+            self.inc,
+            self.inc_scales,
+            self.color,
+            self.komi,
+            self.pieces,
+            self.caps,
+            self.unrated,
+            self.opening,
+        )
+    }
+}
+
+/// Engine side of the PlayTak client, generic over board size (`E::Game` is `Board5`/`Board6`).
+/// Dispatched from `main` by `PLAYTAK_SIZE` (`play_game_playtak::<NNUE5>` / `::<NNUE6>`).
+fn play_game_playtak<E: Evaluator + Default + Send>(
+    server_send: Sender<String>,
+    server_recv: Receiver<TeiCommand>,
+    config: PlaytakConfig,
+) -> Result<()> {
     const MAX_DEPTH: usize = 32;
-    const KOMI: u8 = PLAYTAK_KOMI;
-    // const MAX_OPENING_LENGTH: usize = 10;
-    let mut move_cache = Vec::new();
-    let mut board = Board6::new().with_komi(KOMI);
-    let table = HashTable::new(2 << 26);
-    let mut info = SearchInfo::new(MAX_DEPTH, &table);
-    let book = load_playtak_book();
-    // let mut eval = Weights6::default();
-    let mut eval = crate::eval::NNUE6::default();
-    // eval.add_noise();
-    // let eval = Evaluator6 {};
+    let size = <E::Game as TakBoard>::SIZE;
+    let komi = config.komi;
+    let weights = config.black_opening_weights.clone();
+    let mut move_cache: Vec<GameMove> = Vec::new();
+    let mut board = E::Game::start_position().with_komi(komi);
+    let table = HashTable::new(config.hash_mb * 1024 * 1024);
+    let mut eval = E::default();
     'outer: loop {
         let message = server_recv.recv()?;
         match message {
             TeiCommand::Go(_) => {
-                if let Some(ref book) = book {
-                    dbg!("Found Book");
-                    if false {
-                        let move_str: Vec<_> = move_cache
-                            .iter()
-                            .copied()
-                            .map(|x: GameMove| x.to_ptn::<Board6>())
-                            .collect();
-                        let move_str = move_str.join(" ");
-                        if let Some(next_ptn) = book.lookup(&move_str) {
-                            dbg!(&next_ptn);
-                            let game_move = GameMove::try_from_ptn(&next_ptn, &board);
-                            if let Some(game_move) = game_move {
-                                if board.legal_move(game_move) {
-                                    server_send.send(game_move.to_ptn::<Board6>()).unwrap();
-                                    continue 'outer;
-                                }
-                            }
-                        }
+                // Black's first reply (§4.7): if the bot is Black and only White's opening has been
+                // played, pick a square by weighted archetype instead of searching. Non-corner White
+                // openings return None -> fall through to a normal search.
+                if board.side_to_move() == Color::Black
+                    && board.move_num() == 1
+                    && move_cache.len() == 1
+                {
+                    let opening_ptn = move_cache[0].to_ptn::<E::Game>();
+                    let w_sq = opening_ptn.trim_start_matches('2'); // "2a1" -> "a1"
+                    let reply = if size == 5 {
+                        topaz_tak::openings5::pick_black_reply(w_sq, &weights)
+                    } else {
+                        topaz_tak::openings::pick_black_reply(w_sq, &weights)
+                    };
+                    if let Some(black_sq) = reply {
+                        println!("Black archetype reply to {}: {}", w_sq, black_sq);
+                        server_send.send(black_sq).unwrap();
+                        continue 'outer;
                     }
                 }
-                let use_time = 12_000; // Todo better time management
-                info = SearchInfo::new(MAX_DEPTH, &table)
-                    .set_max_nodes(10000, 10000)
-                    .time_bank(TimeBank::flat(use_time))
-                    .abort_depth(64);
+                // Node-capped search (the strength knob). The flat time bank is a safety net so the
+                // bot never flags; with a low node cap moves finish well within it. Tracking the
+                // server clock for a tighter bank is a future refinement (§4.5).
+                let mut info = SearchInfo::new(MAX_DEPTH, &table)
+                    .time_bank(TimeBank::flat(12_000))
+                    .abort_depth(config.abort_depth);
+                if config.nodes > 0 {
+                    info = info.set_max_nodes(config.nodes, config.nodes);
+                }
                 let res = topaz_tak::search::multi_search(&mut board, &mut eval, &mut info, 1);
                 if let Some(outcome) = res {
                     server_send
@@ -943,9 +1378,29 @@ fn play_game_playtak(server_send: Sender<String>, server_recv: Receiver<TeiComma
             }
             TeiCommand::Position(s) => {
                 move_cache.clear();
-                board = Board6::new().with_komi(KOMI);
+                board = E::Game::start_position().with_komi(komi);
                 for m in s.split(',') {
-                    if let Some(m) = GameMove::try_from_playtak(m, &board) {
+                    if let Some(mut m) = GameMove::try_from_playtak(m, &board) {
+                        // Double Black Stack: the server expands White's opening internally and
+                        // transmits a plain "P <sq>", which parses to a single flat. But the engine
+                        // only treats the move_num()==1 White placement as legal when number()==2
+                        // (board.rs do_move places the 2-flat black stack iff number()==2). Without
+                        // this, replaying the opponent's (or our own) opening yields one black flat
+                        // and a 1-off Black reserve -> desync. Reconstruct the forced 2-flat move.
+                        if board.move_num() == 1
+                            && board.side_to_move() == Color::White
+                            && m.is_place_move()
+                            && !m.is_stack_move()
+                        {
+                            // Rebuild as the forced double placement ("2<sq>", number()==2) via the
+                            // same public PTN path the engine's own move generator uses.
+                            let sq = m.to_ptn::<E::Game>();
+                            if let Some(dbl) =
+                                GameMove::try_from_ptn_m(&format!("2{}", sq), size, Color::White)
+                            {
+                                m = dbl;
+                            }
+                        }
                         move_cache.push(m);
                         board.do_move(m);
                     }
@@ -955,27 +1410,8 @@ fn play_game_playtak(server_send: Sender<String>, server_recv: Receiver<TeiComma
                 break;
             }
             TeiCommand::NewGame(_size) => {
-                // Record poor opening outcome
-                // if last_score < -400 {
-                //     if let Some(side) = my_side {
-                //         let res = match side {
-                //             Color::White => GameResult::BlackWin,
-                //             Color::Black => GameResult::WhiteWin,
-                //         };
-                //         if let Some(op_book) = info.book_mut() {
-                //             op_book.update(Board6::new().with_komi(KOMI), res, move_cache);
-                //             save_playtak_book(op_book)?;
-                //         }
-                //     }
-                // } else if last_score == 0 && board.move_num() >= 30 {
-                //     let res = GameResult::Draw;
-                //     if let Some(op_book) = info.book_mut() {
-                //         op_book.update(Board6::new().with_komi(KOMI), res, move_cache);
-                //         save_playtak_book(op_book)?;
-                //     }
-                // }
-                info.clear_tt();
-                board = Board6::new().with_komi(KOMI);
+                table.clear();
+                board = E::Game::start_position().with_komi(komi);
                 move_cache = Vec::new();
             }
             _ => println!("Unknown command: {:?}", message),
@@ -984,184 +1420,183 @@ fn play_game_playtak(server_send: Sender<String>, server_recv: Receiver<TeiComma
     Ok(())
 }
 
-fn playtak_loop(engine_send: Sender<TeiCommand>, engine_recv: Receiver<String>) {
-    // let mut opp = "Tiltak_Bot";
-    let mut opp = "Foo";
-    // let mut opp = "WilemBot";
-    let login_s = if let Some((user, pass)) = playtak_auth() {
-        format!("Login {} {}\n", user, pass)
-    } else {
-        "Login Guest\n".to_string()
+fn playtak_loop(
+    engine_send: Sender<TeiCommand>,
+    engine_recv: Receiver<String>,
+    config: PlaytakConfig,
+) {
+    let login_s = match (config.username.clone(), config.password.clone()) {
+        (Some(user), Some(pass)) => format!("Login {} {}\n", user, pass),
+        _ => "Login Guest\n".to_string(),
     };
+    let seek_s = config.seek_string();
+    let host = config.host.clone();
+    let port = config.port;
+    let size = config.size;
     std::thread::spawn(move || {
-        let mut com = telnet::Telnet::connect(("playtak.com", 10_000), 2048).unwrap();
-        let mut counter = 0;
-        let mut playing = false;
-        let mut waiting_for_engine = false;
-        let mut my_color = None;
-        let mut game_id = None;
-        let mut goal = None;
-        let mut live_seek = false;
-
-        let mut moves = Vec::new();
-        loop {
-            match com.read_nonblocking() {
-                Ok(event) => match event {
-                    Event::Data(buffer) => {
-                        let s = std::str::from_utf8(&(*buffer)).unwrap();
-                        print!("{}", s);
-                        for line in s.lines() {
-                            if line.starts_with("Login or") {
-                                println!("Logging in");
-                                com.write(login_s.as_bytes()).unwrap();
-                            } else if line.starts_with("Game#") {
-                                let rest = line.split_once(' ').map(|x| x.1);
-                                if let Some(rest) = rest {
-                                    if rest.starts_with('P') || rest.starts_with('M') {
-                                        moves.push(rest.to_string());
-                                    } else if rest.starts_with("Over") {
-                                        // Todo maybe a different command?
-                                        engine_send.send(TeiCommand::NewGame(0)).unwrap();
-                                        counter = 0;
-                                        playing = false;
-                                        waiting_for_engine = false;
-                                        my_color = None;
-                                        game_id = None;
-                                        goal = None;
-                                        live_seek = false;
-                                        moves.clear();
-                                    }
-                                } else {
-                                    dbg!(line);
-                                }
-                            } else if line.starts_with("Seek new") {
-                                if line.contains(opp) {
-                                    goal =
-                                        Some(line.split_whitespace().nth(2).unwrap().to_string());
-                                    println!("Goal: {:?}", goal);
-                                }
-                            } else if line.starts_with("Game Start") {
-                                engine_send.send(TeiCommand::NewGame(0)).unwrap();
-                                game_id = line.split_whitespace().nth(2).map(|x| x.to_string());
-                                my_color = line.split_whitespace().nth(7).map(|x| x.to_lowercase());
-                                playing = true;
-                                dbg!(&game_id);
-                                dbg!(&my_color);
-                                opp = "NONE";
-                            }
-                        }
-                    }
-                    Event::NoData => {
-                        thread::sleep(std::time::Duration::from_secs(1));
-                        counter += 1;
-                        if counter >= 30 {
-                            counter = 0;
-                            println!("Pinging server!");
-                            com.write("PING\n".as_bytes()).unwrap();
-                        }
-                        if !playing {
-                            if let Some(ref id) = goal {
-                                let s = format!("Accept {}\n", id);
-                                com.write(s.as_bytes()).unwrap();
-                                goal = None;
-                            } else if !live_seek && counter >= 5 {
-                                let s = format!("Seek 6 180 15 A {} 30 1 0 0 \n", PLAYTAK_KOMI);
-                                println!("Sending seek!");
-                                com.write(s.as_bytes()).unwrap();
-                                live_seek = true;
-                            }
-                        } else {
-                            let color = my_color.as_ref().unwrap().as_str();
-
-                            let my_turn = match color {
-                                "white" => moves.len() % 2 == 0,
-                                "black" => moves.len() % 2 == 1,
-                                _ => panic!("Weird color?"),
-                            };
-                            if waiting_for_engine {
-                                if let Ok(response) = engine_recv.try_recv() {
-                                    let color = if moves.len() % 2 == 0 {
-                                        Color::White
-                                    } else {
-                                        Color::Black
-                                    };
-                                    let m = GameMove::try_from_ptn_m(&response, 6, color).unwrap();
-                                    let playtak_m = m.to_playtak::<Board6>();
-                                    let message = format!(
-                                        "Game#{} {}\n",
-                                        game_id.as_ref().unwrap(),
-                                        playtak_m
-                                    );
-                                    println!("Sending: {}", message);
-                                    com.write(message.as_bytes()).unwrap();
-                                    waiting_for_engine = false;
-                                    moves.push(playtak_m);
-                                    thread::sleep(std::time::Duration::from_secs(1));
-                                }
-                                continue;
-                            }
-                            if my_turn {
-                                engine_send
-                                    .send(TeiCommand::Position(moves.join(",")))
-                                    .unwrap();
-                                engine_send.send(TeiCommand::Go(TeiGo::default())).unwrap();
-                                waiting_for_engine = true;
-                            }
-                        }
-                    }
-                    _ => {
-                        println!("Got here");
-                        dbg!(event);
-                        break;
-                    }
-                },
+        // Outer reconnect loop: a dropped/errored telnet connection reconnects and re-seeks rather
+        // than killing the process (so a transient blip never abandons future games). Keep-alive
+        // across process exits is still the job of an external restart wrapper (§6.5).
+        'reconnect: loop {
+            let mut com = match telnet::Telnet::connect((host.as_str(), port), 1 << 16) {
+                Ok(c) => c,
                 Err(e) => {
-                    dbg!(e);
-                    break;
+                    println!("Connect to {}:{} failed ({:?}); retrying in 5s", host, port, e);
+                    thread::sleep(std::time::Duration::from_secs(5));
+                    continue 'reconnect;
+                }
+            };
+            // Fresh per-connection state; reset the engine to a clean board for the new session.
+            let _ = engine_send.send(TeiCommand::NewGame(0));
+            let mut opp = "Foo";
+            let mut counter = 0;
+            let mut playing = false;
+            let mut waiting_for_engine = false;
+            let mut my_color: Option<String> = None;
+            let mut game_id: Option<String> = None;
+            let mut goal: Option<String> = None;
+            let mut live_seek = false;
+            let mut moves: Vec<String> = Vec::new();
+            loop {
+                match com.read_nonblocking() {
+                    Ok(event) => match event {
+                        Event::Data(buffer) => {
+                            let s = match std::str::from_utf8(&(*buffer)) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            print!("{}", s);
+                            for line in s.lines() {
+                                if line.starts_with("Login or") {
+                                    // Declare protocol 4 BEFORE login so the fork honors the seekV4
+                                    // `opening` field and emits the protocol-4 Game Start layout
+                                    // (color at token 6). The server sets protocolVersion from a
+                                    // `Protocol <n>` line in its pre-login block and replies "OK".
+                                    println!("Declaring protocol 4 and logging in");
+                                    let _ = com.write(b"Protocol 4\n");
+                                    let _ = com.write(login_s.as_bytes());
+                                } else if line.starts_with("Game#") {
+                                    let rest = line.split_once(' ').map(|x| x.1);
+                                    if let Some(rest) = rest {
+                                        if rest.starts_with('P') || rest.starts_with('M') {
+                                            moves.push(rest.to_string());
+                                        } else if rest.starts_with("Over") {
+                                            // Todo maybe a different command?
+                                            let _ = engine_send.send(TeiCommand::NewGame(0));
+                                            counter = 0;
+                                            playing = false;
+                                            waiting_for_engine = false;
+                                            my_color = None;
+                                            game_id = None;
+                                            goal = None;
+                                            live_seek = false;
+                                            moves.clear();
+                                        }
+                                    } else {
+                                        dbg!(line);
+                                    }
+                                } else if line.starts_with("Seek new") {
+                                    if line.contains(opp) {
+                                        goal = Some(
+                                            line.split_whitespace().nth(2).unwrap().to_string(),
+                                        );
+                                        println!("Goal: {:?}", goal);
+                                    }
+                                } else if line.starts_with("Game Start") {
+                                    let _ = engine_send.send(TeiCommand::NewGame(0));
+                                    game_id =
+                                        line.split_whitespace().nth(2).map(|x| x.to_string());
+                                    // Protocol-4 Game Start: "Game Start <no> <white> vs <black>
+                                    // <color> <size> ..." -> color is token 6 (was token 7 at
+                                    // protocol < 2, which is what the old hardcoded nth(7) assumed).
+                                    my_color =
+                                        line.split_whitespace().nth(6).map(|x| x.to_lowercase());
+                                    playing = true;
+                                    dbg!(&game_id);
+                                    dbg!(&my_color);
+                                    opp = "NONE";
+                                }
+                            }
+                        }
+                        Event::NoData => {
+                            thread::sleep(std::time::Duration::from_secs(1));
+                            counter += 1;
+                            if counter >= 30 {
+                                counter = 0;
+                                println!("Pinging server!");
+                                let _ = com.write("PING\n".as_bytes());
+                            }
+                            if !playing {
+                                if let Some(ref id) = goal {
+                                    let s = format!("Accept {}\n", id);
+                                    let _ = com.write(s.as_bytes());
+                                    goal = None;
+                                } else if !live_seek && counter >= 5 {
+                                    println!("Sending seek: {}", seek_s.trim());
+                                    let _ = com.write(seek_s.as_bytes());
+                                    live_seek = true;
+                                }
+                            } else {
+                                let color = my_color.as_ref().unwrap().as_str();
+
+                                let my_turn = match color {
+                                    "white" => moves.len() % 2 == 0,
+                                    "black" => moves.len() % 2 == 1,
+                                    _ => panic!("Weird color?"),
+                                };
+                                if waiting_for_engine {
+                                    if let Ok(response) = engine_recv.try_recv() {
+                                        let color = if moves.len() % 2 == 0 {
+                                            Color::White
+                                        } else {
+                                            Color::Black
+                                        };
+                                        let m = GameMove::try_from_ptn_m(&response, size, color)
+                                            .unwrap();
+                                        let playtak_m = if size == 5 {
+                                            m.to_playtak::<Board5>()
+                                        } else {
+                                            m.to_playtak::<Board6>()
+                                        };
+                                        let message = format!(
+                                            "Game#{} {}\n",
+                                            game_id.as_ref().unwrap(),
+                                            playtak_m
+                                        );
+                                        println!("Sending: {}", message);
+                                        let _ = com.write(message.as_bytes());
+                                        waiting_for_engine = false;
+                                        moves.push(playtak_m);
+                                        thread::sleep(std::time::Duration::from_secs(1));
+                                    }
+                                    continue;
+                                }
+                                if my_turn {
+                                    let _ = engine_send
+                                        .send(TeiCommand::Position(moves.join(",")));
+                                    let _ = engine_send.send(TeiCommand::Go(TeiGo::default()));
+                                    waiting_for_engine = true;
+                                }
+                            }
+                        }
+                        _ => {
+                            println!(
+                                "Telnet connection ended ({:?}); reconnecting in 5s",
+                                event
+                            );
+                            thread::sleep(std::time::Duration::from_secs(5));
+                            continue 'reconnect;
+                        }
+                    },
+                    Err(e) => {
+                        println!("Telnet read error ({:?}); reconnecting in 5s", e);
+                        thread::sleep(std::time::Duration::from_secs(5));
+                        continue 'reconnect;
+                    }
                 }
             }
-            // println!("Thread sleepy!");
         }
     });
-}
-
-fn playtak_auth() -> Option<(String, String)> {
-    dotenv::dotenv().ok()?;
-    let mut username = None;
-    let mut password = None;
-    for (key, value) in env::vars() {
-        if key == "PLAYTAK_USERNAME" {
-            username = Some(value);
-        } else if key == "PLAYTAK_PASSWORD" {
-            password = Some(value);
-        }
-    }
-    Some((username?, password?))
-}
-
-fn load_playtak_book() -> Option<&'static book::Book> {
-    None
-    // use std::io::Read;
-    // dotenv::dotenv().ok()?;
-    // let mut pt_book = None;
-    // for (key, value) in env::vars() {
-    //     if key == "PLAYTAK_BOOK" {
-    //         pt_book = Some(value);
-    //     }
-    // }
-    // let pt_book = pt_book?;
-    // let mut vec = Vec::new();
-    // if let Ok(mut file) = std::fs::File::open(&pt_book) {
-    //     let mut book_data = String::new();
-    //     file.read_to_string(&mut book_data).ok()?;
-    //     for line in book_data.lines() {
-    //         vec.push(line.to_string());
-    //     }
-    //     let book = book::load_book_data(vec);
-    //     Some(book)
-    // } else {
-    //     None
-    // }
 }
 
 // fn gen_magics() {
