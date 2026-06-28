@@ -678,6 +678,18 @@ macro_rules! board_impl {
 }
 
 #[derive(PartialEq, Clone)]
+pub struct Board4 {
+    pub board: [Stack; Self::SIZE * Self::SIZE],
+    active_player: Color,
+    move_num: usize,
+    flats_left: [usize; 2],
+    caps_left: [usize; 2],
+    pub bits: BitboardStorage<<Self as TakBoard>::Bits>,
+    komi: u8,
+    fifty_move: u8,
+}
+
+#[derive(PartialEq, Clone)]
 pub struct Board5 {
     pub board: [Stack; Self::SIZE * Self::SIZE],
     active_player: Color,
@@ -713,6 +725,7 @@ pub struct Board7 {
     fifty_move: u8,
 }
 
+board_impl![Board4, Bitboard4, 4, 15, 0];
 board_impl![Board5, Bitboard5, 5, 21, 1];
 board_impl![Board6, Bitboard6, 6, 30, 1];
 board_impl![Board7, Bitboard7, 7, 40, 2];
@@ -957,6 +970,61 @@ mod test {
             .map(|depth| crate::perft(&mut board, depth as u16))
             .collect();
         assert_eq!(&p_res[..], &[1, 190, 20698]);
+    }
+
+    #[test]
+    pub fn board4_opening_perft() {
+        // From the start position the black-stack rule forces White's first move to be a
+        // double placement (16 squares), then Black plays a single swapped flat (15 squares).
+        let mut board = Board4::new();
+        let p_res: Vec<_> = (0..3)
+            .map(|depth| crate::perft(&mut board, depth as u16))
+            .collect();
+        assert_eq!(&p_res[..], &[1, 16, 240]);
+    }
+
+    #[test]
+    pub fn board4_zobrist_roundtrip() {
+        // do_move / reverse_move must restore the exact zobrist hash, and the incrementally
+        // maintained hash must match a from-scratch manual build at every node.
+        let tps = "2,1,x,2/x,12,1,x/1,x,2,1/x,1,2,x 1 4";
+        let mut board = Board4::try_from_tps(tps).unwrap();
+        let init_zobrist = zobrist::TABLE.manual_build_hash(&board);
+        assert_eq!(board.bits.zobrist(), init_zobrist.0 ^ init_zobrist.1);
+        let mut moves: Vec<GameMove> = Vec::new();
+        generate_all_moves(&board, &mut moves);
+        assert!(!moves.is_empty());
+        for m in moves {
+            let rev = board.do_move(m);
+            let hash = zobrist::TABLE.manual_build_hash(&board);
+            assert_eq!(board.bits.zobrist(), hash.0 ^ hash.1);
+            board.reverse_move(rev);
+            assert_eq!(board.bits.zobrist(), init_zobrist.0 ^ init_zobrist.1);
+        }
+    }
+
+    #[test]
+    pub fn board4_black_stack_legal_game() {
+        // White's first move is a double black-stack (2a1); Black answers with a single
+        // swapped white flat; then normal placements. Confirms the variant plays a legal
+        // game on the 4x4 board with 0 capstones.
+        let mut board = Board4::new();
+        let mut moves: Vec<GameMove> = Vec::new();
+        for m_str in ["2a1", "d4", "b2", "c3"] {
+            moves.clear();
+            let m = GameMove::try_from_ptn(m_str, &board).expect("invalid ptn");
+            generate_all_moves(&board, &mut moves);
+            assert!(
+                moves.iter().any(|&x| x == m),
+                "illegal move attempted: {m_str}"
+            );
+            board.do_move(m);
+        }
+        // 2a1 spent two black flats; d4 one white flat; b2 one white flat; c3 one black flat.
+        assert_eq!(board.pieces_reserve(Color::White), 15 - 2);
+        assert_eq!(board.pieces_reserve(Color::Black), 15 - 3);
+        assert_eq!(board.caps_reserve(Color::White), 0);
+        assert_eq!(board.caps_reserve(Color::Black), 0);
     }
 
     #[test]

@@ -419,6 +419,64 @@ impl Bitboard7 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bitboard4(u64);
+
+impl Bitboard4 {
+    const DIM: usize = 4;
+    const TABLE_LENGTH: usize = Self::DIM * Self::DIM;
+    // 8-wide padded u64 with a 1-cell border, mirroring Bitboard5: the 4x4 board
+    // occupies rows 2-5 / cols 1-4 (bit indices 17-20, 25-28, 33-36, 41-44).
+    const TOP: Bitboard4 = Bitboard4::new(0x1e0000);
+    const BOTTOM: Bitboard4 = Bitboard4::new(Bitboard4::TOP.0 << 24);
+    const LEFT: Bitboard4 = Bitboard4::new(0x20202020000);
+    const RIGHT: Bitboard4 = Bitboard4::new(0x101010100000);
+    const LEFT_TOP: Bitboard4 = Bitboard4::new(Self::LEFT.0 | Self::TOP.0);
+    const INNER: u64 = 0x1e1e1e1e0000; // 4x4 Board
+    const NS: [Bitboard4; 4] = [
+        Bitboard4(Bitboard4::TOP.0),
+        Bitboard4(Bitboard4::TOP.0 << 8),
+        Bitboard4(Bitboard4::TOP.0 << 16),
+        Bitboard4(Bitboard4::TOP.0 << 24),
+    ];
+    const EW: [Bitboard4; 4] = [
+        Bitboard4(Bitboard4::LEFT.0),
+        Bitboard4(Bitboard4::LEFT.0 << 1),
+        Bitboard4(Bitboard4::LEFT.0 << 2),
+        Bitboard4(Bitboard4::LEFT.0 << 3),
+    ];
+    pub const fn new(data: u64) -> Self {
+        Self(data & Self::INNER)
+    }
+    #[allow(clippy::zero_prefixed_literal)]
+    #[rustfmt::skip]
+    const fn build_bit_to_index_table() -> [usize; 64] {
+        const EMPTY: usize = 100;
+        let arr: [usize; 64] = [
+            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
+            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
+            EMPTY, 00, 01, 02, 03, EMPTY, EMPTY, EMPTY,
+            EMPTY, 04, 05, 06, 07, EMPTY, EMPTY, EMPTY,
+            EMPTY, 08, 09, 10, 11, EMPTY, EMPTY, EMPTY,
+            EMPTY, 12, 13, 14, 15, EMPTY, EMPTY, EMPTY,
+            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
+            EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+        ];
+        arr
+    }
+    #[allow(clippy::zero_prefixed_literal)]
+    #[rustfmt::skip]
+    const fn build_index_to_bit_table() -> [u64; 16] {
+        let arr: [u64; 16] = [
+            17,	18,	19,	20,
+            25,	26,	27,	28,
+            33,	34,	35,	36,
+            41,	42,	43,	44,
+        ];
+        arr
+    }
+}
+
 macro_rules! bitboard_impl {
     ($t: ty, $sz: expr) => {
         impl Default for $t {
@@ -779,6 +837,7 @@ macro_rules! bitboard_impl {
     };
 }
 
+bitboard_impl![Bitboard4, 4];
 bitboard_impl![Bitboard5, 5];
 bitboard_impl![Bitboard6, 6];
 bitboard_impl![Bitboard7, 7];

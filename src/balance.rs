@@ -11,6 +11,7 @@
 
 use crate::board::{Board6, TakBoard};
 use crate::datagen::new_rng;
+use crate::datagen5::Tiltak;
 use crate::eval::NNUE6;
 use crate::search::{search, SearchInfo};
 use crate::transposition_table::HashTable;
@@ -55,6 +56,11 @@ pub struct BalanceConfig {
     /// Record PTN (when `ptnout` is set) for only the first `ptn_limit` games. Default is unlimited.
     pub ptn_limit: usize,
     pub tt_size: usize,
+    /// If set, drive this tiltak TEI binary (self-play) instead of the embedded NNUE6 net — a
+    /// cross-check of 6x6 balance with the native standard engine. Use with `-a`/`--book`.
+    pub tiltak_path: Option<String>,
+    /// Max plies before scoring a game a draw (used in tiltak mode to bound runaway games).
+    pub max_plies: usize,
 }
 
 impl Default for BalanceConfig {
@@ -73,6 +79,8 @@ impl Default for BalanceConfig {
             archetype_weights: None,
             ptn_limit: usize::MAX,
             tt_size: 1 << 20,
+            tiltak_path: None,
+            max_plies: 200,
         }
     }
 }
@@ -153,8 +161,8 @@ fn play_one(
     rng: &mut impl rand_core::RngCore,
     start: Option<&str>,
     ptn_out: Option<&Mutex<File>>,
+    tiltak: Option<&mut Tiltak>,
 ) -> (Outcome, u64) {
-    table.clear();
     let mut plies = 0u64;
 
     // In book mode the opening is baked into the start position; otherwise build it from random
@@ -197,25 +205,49 @@ fn play_one(
     let white_first = board.side_to_move() == Color::White;
     let mut game_moves: Vec<GameMove> = Vec::new();
 
-    // Best play to completion.
-    while board.game_result().is_none() {
-        let mut eval = NNUE6::default();
-        let mut info = SearchInfo::new(MAX_DEPTH, table)
-            .set_max_nodes(cfg.max_nodes, cfg.max_nodes)
-            .quiet(true);
-        let outcome = match search(&mut board, &mut eval, &mut info) {
-            Some(o) => o,
-            None => break,
-        };
-        let mv = match outcome.next() {
-            Some(m) => m,
-            None => break,
-        };
-        if record {
-            game_moves.push(mv);
+    // Best play to completion — driven by tiltak (TEI) if provided, else Topaz NNUE6 search.
+    if let Some(tiltak) = tiltak {
+        let _ = tiltak.new_game(6);
+        while board.game_result().is_none() {
+            if plies >= cfg.max_plies as u64 {
+                break; // bounded draw
+            }
+            let tps = format!("{board:?}");
+            let mv = match tiltak.bestmove(&tps, cfg.max_nodes) {
+                Ok(Some((m, _))) => m,
+                _ => break,
+            };
+            let gm = match GameMove::try_from_ptn(&mv, &board) {
+                Some(g) => g,
+                None => break,
+            };
+            if record {
+                game_moves.push(gm);
+            }
+            board.do_move(gm);
+            plies += 1;
         }
-        board.do_move(mv);
-        plies += 1;
+    } else {
+        table.clear();
+        while board.game_result().is_none() {
+            let mut eval = NNUE6::default();
+            let mut info = SearchInfo::new(MAX_DEPTH, table)
+                .set_max_nodes(cfg.max_nodes, cfg.max_nodes)
+                .quiet(true);
+            let outcome = match search(&mut board, &mut eval, &mut info) {
+                Some(o) => o,
+                None => break,
+            };
+            let mv = match outcome.next() {
+                Some(m) => m,
+                None => break,
+            };
+            if record {
+                game_moves.push(mv);
+            }
+            board.do_move(mv);
+            plies += 1;
+        }
     }
 
     let outcome = match board.game_result() {
@@ -377,7 +409,12 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
         let ptn_writer = ptn_writer.clone();
         handles.push(thread::spawn(move || {
             let mut rng = new_rng();
-            let table = HashTable::new(cfg.tt_size);
+            // tiltak mode: one tiltak subprocess per worker, no TT needed (tiny placeholder table).
+            let mut tiltak = cfg
+                .tiltak_path
+                .as_ref()
+                .map(|p| Tiltak::spawn(p, 6, cfg.komi).expect("failed to spawn tiltak"));
+            let table = HashTable::new(if tiltak.is_some() { 1 } else { cfg.tt_size });
             for i in range {
                 let (start, bucket) = &schedule[i];
                 // Record PTN only for the first `ptn_limit` games (handled in order by worker 0).
@@ -386,7 +423,8 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
                 } else {
                     None
                 };
-                let (outcome, plies) = play_one(&cfg, &table, &mut rng, start.as_deref(), writer);
+                let (outcome, plies) =
+                    play_one(&cfg, &table, &mut rng, start.as_deref(), writer, tiltak.as_mut());
                 tallies[*bucket].record(outcome, plies);
                 let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
                 if done % 1000 == 0 {
@@ -513,6 +551,8 @@ mod test {
             archetype_weights: None,
             ptn_limit: usize::MAX,
             tt_size: 1 << 20,
+            tiltak_path: None,
+            max_plies: 200,
         };
         let r = run(cfg);
         assert_eq!(r.games, 2);
@@ -548,6 +588,8 @@ mod test {
             archetype_weights: None,
             ptn_limit: usize::MAX,
             tt_size: 1 << 20,
+            tiltak_path: None,
+            max_plies: 200,
         };
         let r = run(cfg);
         assert_eq!(r.games, 2);
