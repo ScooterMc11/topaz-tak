@@ -96,6 +96,49 @@ pub fn num_archetypes(standard: bool) -> usize {
     }
 }
 
+/// Black's first-reply square to White's double-black-stack on a corner (PlayTak GemBot use). White's
+/// opening square `white_sq` ("a1"-style) is matched against the corner archetype tables; an archetype
+/// is sampled by `weights` (= `[diagonal, adjacent, hug, gap_hug]`, the center stack is unused here),
+/// then one of that archetype's 1-2 mirror Black squares for `white_sq` is picked uniformly. Returns
+/// `None` if `white_sq` is not a corner (caller should fall back to a normal search) or if the weights
+/// are unusable. Self-seeds its own RNG.
+pub fn pick_black_reply(white_sq: &str, weights: &[f64]) -> Option<String> {
+    if !CORNERS.iter().any(|c| *c == white_sq) {
+        return None;
+    }
+    let tables: [&[(&str, &str)]; 4] = [DIAGONAL, ADJACENT, HUG, GAP_HUG];
+    // Up to 4 weights (diag, adj, hug, gap-hug); missing/negative entries treated as 0.
+    let mut w = [0.0f64; 4];
+    for (i, slot) in w.iter_mut().enumerate() {
+        *slot = weights.get(i).copied().unwrap_or(0.0).max(0.0);
+    }
+    let total: f64 = w.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut rng = new_rng();
+    // Weighted archetype pick.
+    let mut r = (rng.next_u32() as f64 / u32::MAX as f64) * total;
+    let mut arch = 0usize;
+    for (i, wi) in w.iter().enumerate() {
+        arch = i;
+        if r < *wi {
+            break;
+        }
+        r -= *wi;
+    }
+    // Black squares for this corner in the chosen archetype (1-2 mirror options).
+    let opts: Vec<&str> = tables[arch]
+        .iter()
+        .filter(|(ws, _)| *ws == white_sq)
+        .map(|(_, bs)| *bs)
+        .collect();
+    if opts.is_empty() {
+        return None;
+    }
+    Some(opts[(rng.next_u32() as usize) % opts.len()].to_string())
+}
+
 pub struct OpeningsConfig {
     pub count: usize,
     pub tps_path: String,
