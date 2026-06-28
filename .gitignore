@@ -7,3 +7,10 @@ src/*.bin
 *.bin
 *.book
 *.exe
+
+# Local research artifacts, training data, and runtime logs (kept out of the repo)
+/4x4/
+/5x5/
+/6x6/
+results.html
+*.log
