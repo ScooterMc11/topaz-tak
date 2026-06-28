@@ -1,14 +1,20 @@
 use super::{Bitboard, Piece, Stack};
 use crate::board::BitIndexIterator;
 use crate::board::TakBoard;
-use crate::board::{Board5, Board6};
+use crate::board::{Board4, Board5, Board6};
 use crate::Color;
 use crate::Position;
 
 pub use incremental::{BoardData, PieceSquare, NNUE6};
+pub use incremental4::{BoardData as BoardData4, NNUE4};
+pub use incremental5::{BoardData as BoardData5, NNUE5};
 
 #[allow(dead_code)]
 mod incremental;
+#[allow(dead_code)]
+mod incremental4;
+#[allow(dead_code)]
+mod incremental5;
 mod smooth;
 
 pub type Eval = i32;
@@ -68,6 +74,122 @@ pub fn build_nn_repr(game: &Board6) -> BoardData {
         }
     }
     BoardData::new(caps, data, idx as u8, game.side_to_move() == Color::White)
+}
+
+impl Evaluator for NNUE5 {
+    type Game = Board5;
+
+    fn evaluate(&mut self, game: &Self::Game, depth: usize) -> Eval {
+        let takboard = build_nn_repr5(game);
+        let eval = self.incremental_eval(takboard);
+        if depth % 2 == 0 {
+            eval
+        } else {
+            eval + self.tempo_offset
+        }
+    }
+    fn set_tempo_offset(&mut self, tempo: Eval) {
+        self.tempo_offset = tempo;
+    }
+}
+
+impl Evaluator for NNUE4 {
+    type Game = Board4;
+
+    fn evaluate(&mut self, game: &Self::Game, depth: usize) -> Eval {
+        let takboard = build_nn_repr4(game);
+        let eval = self.incremental_eval(takboard);
+        if depth % 2 == 0 {
+            eval
+        } else {
+            eval + self.tempo_offset
+        }
+    }
+    fn set_tempo_offset(&mut self, tempo: Eval) {
+        self.tempo_offset = tempo;
+    }
+}
+
+pub fn build_nn_repr4(game: &Board4) -> incremental4::BoardData {
+    let mut caps = [255, 255];
+    let mut data = [incremental4::PieceSquare(255); 30];
+    let mut idx = 0;
+    let mut cap_idx = 0;
+    for sq in game
+        .active_stacks(Color::White)
+        .chain(game.active_stacks(Color::Black))
+    {
+        let stack = &game.board()[sq];
+        let top = stack.top().unwrap();
+        if top.is_cap() {
+            caps[cap_idx] = sq as u8;
+            cap_idx += 1;
+        }
+        data[idx] = build_piece_square4(sq, top);
+        idx += 1;
+        for i in 1..10 {
+            if let Some(p) = stack.from_top(i) {
+                data[idx] = build_piece_square4(sq, p);
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    incremental4::BoardData::new(caps, data, idx as u8, game.side_to_move() == Color::White)
+}
+
+fn build_piece_square4(sq: usize, piece: Piece) -> incremental4::PieceSquare {
+    let p = match piece {
+        Piece::WhiteFlat => incremental4::WHITE_FLAT,
+        Piece::WhiteWall => incremental4::WHITE_WALL,
+        Piece::WhiteCap => incremental4::WHITE_FLAT, // This is intentional
+        Piece::BlackFlat => incremental4::BLACK_FLAT,
+        Piece::BlackWall => incremental4::BLACK_WALL,
+        Piece::BlackCap => incremental4::BLACK_FLAT, // This is intentional
+    };
+    incremental4::PieceSquare::new(sq, p.0)
+}
+
+pub fn build_nn_repr5(game: &Board5) -> incremental5::BoardData {
+    let mut caps = [255, 255];
+    let mut data = [incremental5::PieceSquare(255); 44];
+    let mut idx = 0;
+    let mut cap_idx = 0;
+    for sq in game
+        .active_stacks(Color::White)
+        .chain(game.active_stacks(Color::Black))
+    {
+        let stack = &game.board()[sq];
+        let top = stack.top().unwrap();
+        if top.is_cap() {
+            caps[cap_idx] = sq as u8;
+            cap_idx += 1;
+        }
+        data[idx] = build_piece_square5(sq, top);
+        idx += 1;
+        for i in 1..10 {
+            if let Some(p) = stack.from_top(i) {
+                data[idx] = build_piece_square5(sq, p);
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    incremental5::BoardData::new(caps, data, idx as u8, game.side_to_move() == Color::White)
+}
+
+fn build_piece_square5(sq: usize, piece: Piece) -> incremental5::PieceSquare {
+    let p = match piece {
+        Piece::WhiteFlat => incremental5::WHITE_FLAT,
+        Piece::WhiteWall => incremental5::WHITE_WALL,
+        Piece::WhiteCap => incremental5::WHITE_FLAT, // This is intentional
+        Piece::BlackFlat => incremental5::BLACK_FLAT,
+        Piece::BlackWall => incremental5::BLACK_WALL,
+        Piece::BlackCap => incremental5::BLACK_FLAT, // This is intentional
+    };
+    incremental5::PieceSquare::new(sq, p.0)
 }
 
 pub fn build_piece_square(sq: usize, piece: Piece) -> PieceSquare {
@@ -464,6 +586,7 @@ fn attackable_cs<B: TakBoard>(color: Color, cs: B::Bits, game: &B) -> i32 {
 // eval_impl![crate::Board7, Weights7];
 eval_impl![Board6, Weights6];
 eval_impl![Board5, Weights5];
+eval_impl![Board4, Weights4];
 
 #[cfg(test)]
 struct BitOutcome<B> {
@@ -642,6 +765,71 @@ fn connected_components<B: Bitboard, F: Fn(B, B) -> B>(mut bits: B, flood_fn: F)
         count += 1;
     }
     BitOutcome::new(largest, count)
+}
+
+pub struct Weights4 {
+    location: [i32; 16],
+    connectivity: i32,
+    tempo_offset: i32,
+    piece: [i32; 3],
+    stack_eval: StackEval,
+    flat_road: [i32; 4],
+    cs_threat: i32,
+    flat_advantage: [i32; 11],
+    reserve_diff: [i32; 11],
+}
+
+impl Weights4 {
+    pub fn new(
+        location: [i32; 16],
+        connectivity: i32,
+        tempo_offset: i32,
+        piece: [i32; 3],
+        stack_top: [i32; 6],
+        flat_road: [i32; 4],
+        cs_threat: i32,
+    ) -> Self {
+        Self {
+            location,
+            connectivity,
+            tempo_offset,
+            piece,
+            stack_eval: StackEval::build_simple(stack_top),
+            flat_road,
+            cs_threat,
+            flat_advantage: [0; 11],
+            reserve_diff: [0; 11],
+        }
+    }
+    fn piece_weight(&self, p: Piece) -> i32 {
+        match p {
+            Piece::WhiteFlat | Piece::BlackFlat => self.piece[0],
+            Piece::WhiteWall | Piece::BlackWall => self.piece[1],
+            Piece::WhiteCap | Piece::BlackCap => self.piece[2],
+        }
+    }
+}
+
+impl Default for Weights4 {
+    fn default() -> Self {
+        let piece_arr = [
+            Evaluator6::piece_weight(Piece::WhiteFlat),
+            Evaluator6::piece_weight(Piece::WhiteWall),
+            Evaluator6::piece_weight(Piece::WhiteCap),
+        ];
+        let st1 = Evaluator6::stack_top_multiplier(Piece::WhiteFlat);
+        let st2 = Evaluator6::stack_top_multiplier(Piece::WhiteWall);
+        let st3 = Evaluator6::stack_top_multiplier(Piece::WhiteCap);
+        Self::new(
+            LOCATION_WEIGHT4,
+            Evaluator6::CONNECTIVITY,
+            Evaluator6::TEMPO_OFFSET,
+            piece_arr,
+            [st1.0, st1.1, st2.0, st2.1, st3.0, st3.1],
+            [40, 30, 15, 5],
+            50,
+        )
+    }
 }
 
 pub struct Weights5 {
@@ -1000,6 +1188,15 @@ const LOCATION_WEIGHT7: [i32; 49] = [
 
 #[allow(clippy::zero_prefixed_literal)]
 #[rustfmt::skip]
+const LOCATION_WEIGHT4: [i32; 16] = [
+    00, 05, 05, 00,
+    05, 10, 10, 05,
+    05, 10, 10, 05,
+    00, 05, 05, 00,
+];
+
+#[allow(clippy::zero_prefixed_literal)]
+#[rustfmt::skip]
 const LOCATION_WEIGHT5: [i32; 25] = [
     00, 05, 05, 05, 00,
     05, 10, 15, 10, 05,
@@ -1024,6 +1221,40 @@ mod test {
             dbg!(m.to_ptn::<Board6>());
         }
         assert_eq!(tak_threats.len(), 5);
+    }
+    #[test]
+    fn nnue4_wiring_smoke() {
+        use crate::board::Board4;
+        // Position with a wall and a buried flat to exercise walls, high square indices,
+        // and the buried-flat depth path on the 0-cap 4x4 board.
+        let tps = "x3,1/x4/x,2S,x2/12,x3 1 4";
+        let board = Board4::try_from_tps(tps).unwrap();
+        let data = build_nn_repr4(&board);
+        // Net-agnostic: the incremental eval (diffed from the empty accumulator) must equal the
+        // from-scratch eval, and stay in-bounds / sane — holds for the zero placeholder or a real
+        // trained net.
+        let manual = NNUE4::manual_eval(data);
+        let mut eval = NNUE4::default();
+        let incremental = eval.evaluate(&board, 0);
+        assert_eq!(manual, incremental);
+        assert!(manual.abs() < 100_000, "eval out of sane range: {manual}");
+    }
+    #[test]
+    fn nnue5_wiring_smoke() {
+        use crate::board::Board5;
+        // Position with a cap, a wall, and a buried flat to exercise promote_cap,
+        // walls, high square indices, and the buried-flat depth path.
+        let tps = "x4,1C/x5/x,2S,x3/x5/12,x4 1 4";
+        let board = Board5::try_from_tps(tps).unwrap();
+        let data = build_nn_repr5(&board);
+        // Net-agnostic: the incremental eval (diffed from the empty accumulator) must equal the
+        // from-scratch eval, and stay in-bounds / sane — holds for the zero placeholder or a real
+        // trained net.
+        let manual = NNUE5::manual_eval(data);
+        let mut eval = NNUE5::default();
+        let incremental = eval.evaluate(&board, 0);
+        assert_eq!(manual, incremental);
+        assert!(manual.abs() < 100_000, "eval out of sane range: {manual}");
     }
     #[test]
     fn components() {

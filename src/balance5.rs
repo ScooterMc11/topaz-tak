@@ -1,23 +1,22 @@
-//! Self-play balance assessment for the "black stack setup" ruleset.
+//! Self-play balance assessment for 5x5 (Board5/NNUE5 port of [`crate::balance`]).
 //!
-//! Plays many self-play games (the same net on both sides) under the new rules (forced `2xx`
-//! opening, komi 0) and reports win rates and win types (road vs flat) for White and Black. This
-//! answers the core question of the experiment: does black-stack + 0 komi actually balance the
-//! game the way 2-komi did? A result near 50/50 means it worked.
+//! Plays many self-play games (the same net on both sides) and reports White/Black win rates and
+//! win types (road vs flat) with a 95% CI. Used to compare the balance of the **black-stack** variant
+//! (komi 0, black-stack net + black-stack book) against **standard** 5x5 (komi 0, standard net +
+//! standard book). A result near 50/50 is balanced; far from it is not.
 //!
-//! Games are diversified with a few random opening plies (otherwise a deterministic engine plays
-//! the same game every time); randomness is symmetric across colors, so it adds variance but no
-//! white/black bias.
+//! Book positions are at `move_num >= 2`, so games start past the opening and the black-stack rule
+//! never fires from a book — i.e. a standard book gives standard play. Komi is applied to the start
+//! position. Output feeds the comparison info-sheets (`gen_sheets.py`).
 
-use crate::board::{Board6, TakBoard};
+use crate::board::{Board5, TakBoard};
 use crate::datagen::new_rng;
-use crate::datagen5::Tiltak;
-use crate::eval::NNUE6;
+use crate::datagen5::{do_random_flat_move, Tiltak};
+use crate::eval::NNUE5;
 use crate::search::{search, SearchInfo};
 use crate::transposition_table::HashTable;
 use crate::{Color, GameMove, GameResult, Position};
 
-use rand_core::RngCore;
 use std::fs::{self, File};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,26 +37,27 @@ pub struct BalanceConfig {
     pub corner_open: bool,
     /// If set, a TPS opening book (one position per line). Each position is played exactly once,
     /// deterministically — the book size becomes the game count and `random_plies`/`corner_open`
-    /// are ignored. See `topaz openings`.
+    /// are ignored. See `topaz openings5`.
     pub book_path: Option<String>,
-    /// Half-komi added to Black in the win check (0 for the black-stack rule; 4 = 2 komi for the
-    /// standard-Tak comparison). Applied to every game's starting position.
+    /// Half-komi added to Black in the win check (0 for the black-stack variant and the standard
+    /// 0-komi comparison). Applied to every game's starting position.
     pub komi: u8,
     /// If set, write each played game as PTN (with a `[TPS]` start tag) to this file. Forces
     /// single-threaded play; intended for inspecting a small sample (use a small book).
     pub ptnout: Option<String>,
-    /// Generate the black-stack book internally (`num_games` openings) and break results down by
-    /// opening archetype. Overrides `book_path`/`random_plies`.
+    /// Generate the opening book internally (`num_games` openings) and break results down by opening
+    /// archetype. Overrides `book_path`/`random_plies`.
     pub archetype_breakdown: bool,
-    /// With `archetype_breakdown`: generate standard (2-komi) openings instead of black-stack.
+    /// With `archetype_breakdown`: generate standard openings instead of black-stack.
     pub standard_book: bool,
     /// With `archetype_breakdown`: per-archetype relative weights (None = uniform).
     pub archetype_weights: Option<Vec<f64>>,
     /// Record PTN (when `ptnout` is set) for only the first `ptn_limit` games. Default is unlimited.
     pub ptn_limit: usize,
     pub tt_size: usize,
-    /// If set, drive this tiltak TEI binary (self-play) instead of the embedded NNUE6 net — a
-    /// cross-check of 6x6 balance with the native standard engine. Use with `-a`/`--book`.
+    /// If set, drive this tiltak TEI binary (self-play) instead of the embedded NNUE5 net — a
+    /// cross-check of standard balance with the native standard engine. Use with `-a`/`--book`
+    /// (book openings); the random-opening path forces the `2xx` move tiltak can't make.
     pub tiltak_path: Option<String>,
     /// Max plies before scoring a game a draw (used in tiltak mode to bound runaway games).
     pub max_plies: usize,
@@ -69,7 +69,7 @@ impl Default for BalanceConfig {
             num_games: 20000,
             threads: 4,
             max_nodes: 15000,
-            random_plies: 3,
+            random_plies: 4,
             corner_open: false,
             book_path: None,
             komi: 0,
@@ -165,21 +165,18 @@ fn play_one(
 ) -> (Outcome, u64) {
     let mut plies = 0u64;
 
-    // In book mode the opening is baked into the start position; otherwise build it from random
-    // flat opening plies (plus an optional forced corner stack).
     let mut board = match start {
-        Some(tps) => Board6::try_from_tps(tps)
+        Some(tps) => Board5::try_from_tps(tps)
             .expect("balance book contained an invalid tps")
             .with_komi(cfg.komi),
         None => {
-            let mut board = Board6::new().with_komi(cfg.komi);
+            let mut board = Board5::new().with_komi(cfg.komi);
 
-            // Optionally pin White's opening double-black-stack to a (random) corner. All four
-            // corners are symmetric, so this just averages out per-square quirks in the net.
+            // Optionally pin White's opening double-black-stack to a (random) corner.
             if cfg.corner_open {
-                const CORNERS: [&str; 4] = ["2a1", "2f1", "2a6", "2f6"];
+                const CORNERS: [&str; 4] = ["2a1", "2e1", "2a5", "2e5"];
                 let mv =
-                    GameMove::try_from_ptn_m(CORNERS[(rng.next_u32() % 4) as usize], 6, Color::White)
+                    GameMove::try_from_ptn_m(CORNERS[(rng.next_u32() % 4) as usize], 5, Color::White)
                         .expect("valid corner double-placement");
                 board.do_move(mv);
                 plies += 1;
@@ -190,24 +187,22 @@ fn play_one(
                 if board.game_result().is_some() {
                     break;
                 }
-                board.do_random_flat_move(rng);
+                do_random_flat_move(&mut board, rng);
                 plies += 1;
             }
             board
         }
     };
 
-    // Capture the start-of-best-play position (book position, or position after random plies) so
-    // the recorded PTN is replayable from a `[TPS]` tag. Only when --ptnout is active.
     let record = ptn_out.is_some();
     let start_tps = if record { Some(format!("{board:?}")) } else { None };
     let start_move_num = board.move_num();
     let white_first = board.side_to_move() == Color::White;
     let mut game_moves: Vec<GameMove> = Vec::new();
 
-    // Best play to completion — driven by tiltak (TEI) if provided, else Topaz NNUE6 search.
+    // Best play to completion — driven by tiltak (TEI) if provided, else Topaz NNUE5 search.
     if let Some(tiltak) = tiltak {
-        let _ = tiltak.new_game(6);
+        let _ = tiltak.new_game(5);
         while board.game_result().is_none() {
             if plies >= cfg.max_plies as u64 {
                 break; // bounded draw
@@ -230,7 +225,7 @@ fn play_one(
     } else {
         table.clear();
         while board.game_result().is_none() {
-            let mut eval = NNUE6::default();
+            let mut eval = NNUE5::default();
             let mut info = SearchInfo::new(MAX_DEPTH, table)
                 .set_max_nodes(cfg.max_nodes, cfg.max_nodes)
                 .quiet(true);
@@ -268,7 +263,6 @@ fn play_one(
         _ => Outcome::Draw,
     };
 
-    // Write this game's PTN (start position as a [TPS] tag, plus the played moves).
     if let (Some(file), Some(tps)) = (ptn_out, start_tps) {
         let result_str = match outcome {
             Outcome::WhiteRoad | Outcome::WhiteFlat => "1-0",
@@ -277,7 +271,7 @@ fn play_one(
         };
         let moves_str = moves_to_ptn(&game_moves, start_move_num, white_first);
         let block = format!(
-            "[Site \"Topaz balance\"]\n[TPS \"{tps}\"]\n[Komi \"{}\"]\n[Result \"{result_str}\"]\n\n{moves_str}{result_str}\n\n",
+            "[Site \"Topaz balance5\"]\n[TPS \"{tps}\"]\n[Komi \"{}\"]\n[Result \"{result_str}\"]\n\n{moves_str}{result_str}\n\n",
             cfg.komi
         );
         let _ = file.lock().unwrap().write_all(block.as_bytes());
@@ -286,22 +280,21 @@ fn play_one(
     (outcome, plies)
 }
 
-/// Format a move list as numbered PTN starting from `start_move_num`. `white_first` is whether White
-/// is to move at the start position (always true for the black-stack/standard books).
+/// Format a move list as numbered PTN starting from `start_move_num`.
 fn moves_to_ptn(moves: &[GameMove], start_move_num: usize, white_first: bool) -> String {
     let mut s = String::new();
     let mut num = start_move_num;
     let mut i = 0;
     if !white_first && i < moves.len() {
-        s.push_str(&format!("{num}. -- {} ", moves[i].to_ptn::<Board6>()));
+        s.push_str(&format!("{num}. -- {} ", moves[i].to_ptn::<Board5>()));
         i += 1;
         num += 1;
     }
     while i < moves.len() {
-        let w = moves[i].to_ptn::<Board6>();
+        let w = moves[i].to_ptn::<Board5>();
         i += 1;
         if i < moves.len() {
-            let b = moves[i].to_ptn::<Board6>();
+            let b = moves[i].to_ptn::<Board5>();
             i += 1;
             s.push_str(&format!("{num}. {w} {b} "));
         } else {
@@ -317,9 +310,6 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
     assert!(cfg.threads >= 1, "need at least one thread");
     let start = Instant::now();
 
-    // Optional fixed opening book (TPS, one position per line). In book mode every position is
-    // played exactly once and deterministically, so the book size IS the game count and the random
-    // plies / corner-open settings are ignored.
     let book: Option<Vec<String>> = cfg.book_path.as_ref().map(|path| {
         let data = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("could not read opening book {path}: {e}"));
@@ -330,16 +320,12 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
             .collect::<Vec<_>>()
     });
 
-    // Build the schedule of (start position, archetype bucket). Three sources, in priority order:
-    //  - archetype breakdown: generate the black-stack book internally, bucket by archetype
-    //  - external book: one deterministic game per TPS line (single bucket)
-    //  - random: num_games random-opening games (single bucket)
     let labeled = cfg.archetype_breakdown.then(|| match &cfg.archetype_weights {
-        Some(w) => crate::openings::generate_weighted(cfg.num_games, cfg.standard_book, w),
-        None => crate::openings::generate(cfg.num_games, cfg.standard_book),
+        Some(w) => crate::openings5::generate_weighted(cfg.num_games, cfg.standard_book, w),
+        None => crate::openings5::generate(cfg.num_games, cfg.standard_book),
     });
     let num_buckets = if cfg.archetype_breakdown {
-        crate::openings::num_archetypes(cfg.standard_book)
+        crate::openings5::num_archetypes(cfg.standard_book)
     } else {
         1
     };
@@ -355,7 +341,7 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
 
     if cfg.archetype_breakdown {
         println!(
-            "balance: {} generated {} openings (per-archetype breakdown{}), {} threads, {} nodes/move (half-komi {})",
+            "balance5: {} generated {} openings (per-archetype breakdown{}), {} threads, {} nodes/move (half-komi {})",
             total_games,
             if cfg.standard_book { "standard" } else { "black-stack" },
             if cfg.archetype_weights.is_some() { ", weighted" } else { "" },
@@ -363,12 +349,12 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
         );
     } else if let Some(b) = &book {
         println!(
-            "balance: {} book positions from {} (1 deterministic game each), {} threads, {} nodes/move (half-komi {})",
+            "balance5: {} book positions from {} (1 deterministic game each), {} threads, {} nodes/move (half-komi {})",
             b.len(), cfg.book_path.as_deref().unwrap_or(""), cfg.threads, cfg.max_nodes, cfg.komi,
         );
     } else {
         println!(
-            "balance: {} games, {} threads, {} nodes/move, {} random flat plies{} (half-komi {})",
+            "balance5: {} games, {} threads, {} nodes/move, {} random flat plies{} (half-komi {})",
             cfg.num_games, cfg.threads, cfg.max_nodes, cfg.random_plies,
             if cfg.corner_open { ", White opens in a corner" } else { "" }, cfg.komi,
         );
@@ -379,9 +365,6 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
             File::create(path).unwrap_or_else(|e| panic!("could not create ptnout {path}: {e}")),
         ))
     });
-    // Recording PTN for ALL games forces single-thread (clean ordering). When only a prefix is
-    // recorded (ptn_limit < total), the run stays multi-threaded: the first worker handles the low
-    // indices in order, so the sample is clean as long as ptn_limit <= total/threads.
     let threads = if ptn_writer.is_some() && cfg.ptn_limit >= total_games {
         1
     } else {
@@ -413,11 +396,10 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
             let mut tiltak = cfg
                 .tiltak_path
                 .as_ref()
-                .map(|p| Tiltak::spawn(p, 6, cfg.komi).expect("failed to spawn tiltak"));
+                .map(|p| Tiltak::spawn(p, 5, cfg.komi).expect("failed to spawn tiltak"));
             let table = HashTable::new(if tiltak.is_some() { 1 } else { cfg.tt_size });
             for i in range {
                 let (start, bucket) = &schedule[i];
-                // Record PTN only for the first `ptn_limit` games (handled in order by worker 0).
                 let writer = if i < cfg.ptn_limit {
                     ptn_writer.as_deref()
                 } else {
@@ -428,7 +410,7 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
                 tallies[*bucket].record(outcome, plies);
                 let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
                 if done % 1000 == 0 {
-                    eprintln!("balance: {done} games");
+                    eprintln!("balance5: {done} games");
                 }
             }
         }));
@@ -445,7 +427,7 @@ pub fn run(cfg: BalanceConfig) -> BalanceResult {
         for (i, r) in per.iter().enumerate() {
             println!(
                 "\n[{}]  ({} games, {:.1}% of book)",
-                crate::openings::archetype_name(i),
+                crate::openings5::archetype_name(i),
                 r.games,
                 100.0 * r.games as f64 / result.games.max(1) as f64,
             );
@@ -483,14 +465,12 @@ fn print_block(r: &BalanceResult) {
     let w = r.white_wins();
     let b = r.black_wins();
     let pct = |x: u64| 100.0 * x as f64 / n;
-    // Per-colour win-type split: fraction of THAT colour's wins (road% + flat% = 100%).
     let split = |road: u64, flat: u64| {
         let tot = (road + flat).max(1) as f64;
         (100.0 * road as f64 / tot, 100.0 * flat as f64 / tot)
     };
     let (wr, wf) = split(r.white_road, r.white_flat);
     let (br, bf) = split(r.black_road, r.black_flat);
-    // 95% CI on the White win rate (binomial normal approximation).
     let p = w as f64 / n;
     let ci = 1.96 * (p * (1.0 - p) / n).sqrt() * 100.0;
     let roads = r.white_road + r.black_road;
@@ -535,14 +515,13 @@ mod test {
     use super::*;
 
     #[test]
-    fn balance_run_accounts_for_all_games() {
-        // Tiny, fast run: just verify the plumbing and that every game is classified exactly once.
+    fn balance5_accounts_for_all_games() {
         let cfg = BalanceConfig {
             num_games: 2,
             threads: 2,
             max_nodes: 100,
-            random_plies: 3,
-            corner_open: true, // exercise the forced-corner opening path
+            random_plies: 4,
+            corner_open: true,
             book_path: None,
             komi: 0,
             ptnout: None,
@@ -561,41 +540,5 @@ mod test {
             2
         );
         assert!(r.total_plies > 0);
-    }
-
-    #[test]
-    fn balance_book_mode_plays_each_position_once() {
-        // Two book positions -> exactly two games, regardless of num_games.
-        let dir = std::env::temp_dir();
-        let book = dir.join("topaz_balance_book_test.tps");
-        std::fs::write(
-            &book,
-            "x,x,x,x,2,x/x,x,x,x,x,x/x,x,x,x,x,x/x,1,x,x,x,x/1,x,x,x,2,x/x,x,x,x,x,22 1 4\n\
-             22,2,x,x,x,1/x,x,2,x,x,x/x,x,x,x,x,x/x,x,x,x,1,x/x,1,x,x,x,x/x,x,x,x,x,x 1 4\n",
-        )
-        .unwrap();
-        let cfg = BalanceConfig {
-            num_games: 100, // ignored in book mode
-            threads: 2,
-            max_nodes: 100,
-            random_plies: 6,
-            corner_open: false,
-            book_path: Some(book.to_string_lossy().into_owned()),
-            komi: 0,
-            ptnout: None,
-            archetype_breakdown: false,
-            standard_book: false,
-            archetype_weights: None,
-            ptn_limit: usize::MAX,
-            tt_size: 1 << 20,
-            tiltak_path: None,
-            max_plies: 200,
-        };
-        let r = run(cfg);
-        assert_eq!(r.games, 2);
-        assert_eq!(
-            r.white_road + r.white_flat + r.black_road + r.black_flat + r.draws,
-            2
-        );
     }
 }

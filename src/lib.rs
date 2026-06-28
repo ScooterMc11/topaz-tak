@@ -6,21 +6,33 @@ pub use move_gen::{generate_all_moves, GameMove, RevGameMove};
 
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod balance;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod balance4;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod balance5;
 pub mod board;
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod datagen;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod datagen4;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod datagen5;
 #[cfg(feature = "evaluation")]
 pub mod eval;
 pub mod move_gen;
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod openings;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod openings4;
+#[cfg(all(feature = "evaluation", feature = "random"))]
+pub mod openings5;
 pub mod proof;
 #[cfg(feature = "evaluation")]
 pub mod search;
 #[cfg(feature = "evaluation")]
 pub mod transposition_table;
 
-use crate::board::{Board5, Board6, Board7};
+use crate::board::{Board4, Board5, Board6, Board7};
 #[cfg(feature = "evaluation")]
 use crate::search::SearchHyper;
 
@@ -35,6 +47,10 @@ pub struct GameInitializer {
     pub max_nodes: i64,
     pub multi_pv: usize,
     pub hyper: SearchHyper,
+    /// Iterative-deepening depth below which time/node aborts are NOT honored (the search always
+    /// completes at least this depth). The default 6 imposes a ~depth-6 floor (~4k nodes on 6x6),
+    /// so low `max_nodes` caps don't bite. Lower it (e.g. 1) to let small node caps take effect.
+    pub early_abort_depth: usize,
 }
 
 #[cfg(feature = "evaluation")]
@@ -49,6 +65,7 @@ impl GameInitializer {
             num_threads: 1,
             multi_pv: 1,
             hyper: SearchHyper::default(),
+            early_abort_depth: 6,
         }
     }
     pub fn get_board<E: eval::Evaluator + Default>(&self) -> (E::Game, E) {
@@ -91,6 +108,7 @@ impl std::default::Default for GameInitializer {
             max_nodes: -1,
             multi_pv: 1,
             hyper: SearchHyper::default(),
+            early_abort_depth: 6,
         }
     }
 }
@@ -197,6 +215,7 @@ pub trait Position {
 
 #[non_exhaustive]
 pub enum TakGame {
+    Standard4(Board4),
     Standard5(Board5),
     Standard6(Board6),
     Standard7(Board7),
@@ -206,6 +225,7 @@ impl TakGame {
     pub fn try_from_tps(tps: &str) -> Result<Self> {
         let size = tps.chars().filter(|&c| c == '/').count() + 1;
         match size {
+            4 => Ok(TakGame::Standard4(Board4::try_from_tps(tps)?)),
             5 => Ok(TakGame::Standard5(Board5::try_from_tps(tps)?)),
             6 => Ok(TakGame::Standard6(Board6::try_from_tps(tps)?)),
             7 => Ok(TakGame::Standard7(Board7::try_from_tps(tps)?)),
@@ -214,6 +234,7 @@ impl TakGame {
     }
     pub fn try_new(size: usize) -> Result<Self> {
         match size {
+            4 => Ok(TakGame::Standard4(Board4::new())),
             5 => Ok(TakGame::Standard5(Board5::new())),
             6 => Ok(TakGame::Standard6(Board6::new())),
             7 => Ok(TakGame::Standard7(Board7::new())),
@@ -222,6 +243,7 @@ impl TakGame {
     }
     pub fn try_new_with_komi(size: usize, half_flats: u8) -> Result<Self> {
         match size {
+            4 => Ok(TakGame::Standard4(Board4::new().with_komi(half_flats))),
             5 => Ok(TakGame::Standard5(Board5::new().with_komi(half_flats))),
             6 => Ok(TakGame::Standard6(Board6::new().with_komi(half_flats))),
             7 => Ok(TakGame::Standard7(Board7::new().with_komi(half_flats))),
@@ -244,6 +266,7 @@ impl Position for TakGame {
 
     fn side_to_move(&self) -> Color {
         match self {
+            TakGame::Standard4(board) => board.side_to_move(),
             TakGame::Standard5(board) => board.side_to_move(),
             TakGame::Standard6(board) => board.side_to_move(),
             TakGame::Standard7(board) => board.side_to_move(),
@@ -252,6 +275,7 @@ impl Position for TakGame {
 
     fn generate_moves(&self, moves: &mut Vec<Self::Move>) {
         match self {
+            TakGame::Standard4(board) => board.generate_moves(moves),
             TakGame::Standard5(board) => board.generate_moves(moves),
             TakGame::Standard6(board) => board.generate_moves(moves),
             TakGame::Standard7(board) => board.generate_moves(moves),
@@ -260,6 +284,7 @@ impl Position for TakGame {
 
     fn do_move(&mut self, mv: Self::Move) -> Self::ReverseMove {
         match self {
+            TakGame::Standard4(board) => board.do_move(mv),
             TakGame::Standard5(board) => board.do_move(mv),
             TakGame::Standard6(board) => board.do_move(mv),
             TakGame::Standard7(board) => board.do_move(mv),
@@ -268,6 +293,7 @@ impl Position for TakGame {
 
     fn reverse_move(&mut self, mv: Self::ReverseMove) {
         match self {
+            TakGame::Standard4(board) => board.reverse_move(mv),
             TakGame::Standard5(board) => board.reverse_move(mv),
             TakGame::Standard6(board) => board.reverse_move(mv),
             TakGame::Standard7(board) => board.reverse_move(mv),
@@ -276,6 +302,7 @@ impl Position for TakGame {
 
     fn game_result(&self) -> Option<GameResult> {
         match self {
+            TakGame::Standard4(board) => board.game_result(),
             TakGame::Standard5(board) => board.game_result(),
             TakGame::Standard6(board) => board.game_result(),
             TakGame::Standard7(board) => board.game_result(),
