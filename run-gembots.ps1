@@ -1,4 +1,4 @@
-# run-gembots.ps1 — launch BOTH GemBots (each in its own window, each with its own restart loop).
+# run-gembots.ps1 - launch BOTH GemBots (each in its own window, each with its own restart loop).
 #
 # Local test (default):   .\run-gembots.ps1
 # BETA, rated:            .\run-gembots.ps1 -ServerHost beta.playtak.com -Port 10002 -Pass6 <pw6> -Pass5 <pw5> -Rated

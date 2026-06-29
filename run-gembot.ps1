@@ -1,9 +1,9 @@
-# run-gembot.ps1 — launch a GemBot (Topaz) with auto-restart.
+# run-gembot.ps1 - launch a GemBot (Topaz) with auto-restart.
 #
 # The bot also auto-reconnects IN-PROCESS on telnet drops; this restart loop is belt-and-suspenders
 # for hard crashes. Run one instance per bot (two terminals), or via run-gembots.ps1.
 #
-# Stage hosts/ports (playtak-api/server/README.md). Telnet is UNENCRYPTED — the login password is
+# Stage hosts/ports (playtak-api/server/README.md). Telnet is UNENCRYPTED - the login password is
 # sent in plaintext, so over the public internet that is a (minor, bot-account) exposure:
 #   Local: localhost          10000   (now)
 #   Beta:  beta.playtak.com    10002   (after the DBS PR merges to dev)
@@ -24,6 +24,11 @@ param(
   # ladder tells you (depth-quantized, so expect a few discrete rungs).
   [int]$Nodes = $(if ($Size -eq 5) { 220 } else { 55 }),
   [int]$AbortDepth = 1,
+  # Ladder weakening (provisional, calibrated 2026-06-29; live ladder is the real anchor). 0 = full
+  # strength (Advanced). Higher Temperature => weaker via softmax move-selection over the top MovePool
+  # root moves. See run-ladder.ps1 for the per-level values.
+  [int]$Temperature = 0,
+  [int]$MovePool = 5,        # MultiPV pool to sample among when Temperature>0 (max 8)
   [string]$ServerHost = "localhost",
   [int]$Port = 10000,
   [switch]$Rated,            # omit = unrated (test); -Rated = rated (deploy)
@@ -37,6 +42,8 @@ $env:PLAYTAK_PASSWORD = $Pass
 $env:PLAYTAK_SIZE = "$Size"
 $env:PLAYTAK_NODES = "$Nodes"
 $env:PLAYTAK_ABORT_DEPTH = "$AbortDepth"
+$env:PLAYTAK_TEMPERATURE = "$Temperature"
+$env:PLAYTAK_MOVE_POOL = "$MovePool"
 $env:PLAYTAK_HASH_MB = "$HashMb"
 $env:PLAYTAK_OPENING = "1"        # Double Black Stack
 $env:PLAYTAK_TIME = "180"         # 3 min base
@@ -46,10 +53,10 @@ $env:PLAYTAK_COLOR = "A"          # accept either color
 $env:PLAYTAK_UNRATED = $(if ($Rated) { "0" } else { "1" })
 
 $bin = Join-Path $PSScriptRoot "target\release\topaz.exe"
-if (-not (Test-Path $bin)) { Write-Error "topaz.exe not found at $bin — build it first (cargo build --release)"; exit 1 }
+if (-not (Test-Path $bin)) { Write-Error "topaz.exe not found at $bin - build it first (cargo build --release)"; exit 1 }
 
-Write-Host ("Launching {0}: size {1}, nodes {2}, abort {3}, {4}:{5}, rated={6}" -f `
-    $User, $Size, $Nodes, $AbortDepth, $ServerHost, $Port, $Rated.IsPresent)
+Write-Host ("Launching {0}: size {1}, nodes {2}, abort {3}, temp {4}, pool {5}, {6}:{7}, rated={8}" -f `
+    $User, $Size, $Nodes, $AbortDepth, $Temperature, $MovePool, $ServerHost, $Port, $Rated.IsPresent)
 while ($true) {
   & $bin playtak
   Write-Host "$User exited (code $LASTEXITCODE); restarting in 5s..."
