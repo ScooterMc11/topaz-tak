@@ -10,12 +10,16 @@
 #   Local test (all accounts pw 'password', UNRATED):   .\run-ladder.ps1
 #   Local rated:                                         .\run-ladder.ps1 -Rated
 #   Just the 6x6 bots:                                   .\run-ladder.ps1 -Only AdvancedBot6,IntermediateBot6,NoviceBot6
-#   BETA later:    .\run-ladder.ps1 -ServerHost beta.playtak.com -Port 10002 -Pass <pw> -Rated
+#   BETA, rated (per-bot passwords via the {user} template):
+#       .\run-ladder.ps1 -ServerHost beta.playtak.com -Port 10002 -Pass "{user}_S3cret!" -Rated
 #
 param(
   [string]$ServerHost = "localhost",
   [int]$Port = 10000,
-  [string]$Pass = "password",     # applied to all six (the local dev accounts); override per stage
+  # Password TEMPLATE shared by all six. The token {user} is replaced by each bot's username, so one
+  # flag gives every bot a distinct password (e.g. -Pass "{user}_S3cret!" => AdvancedBot6 logs in with
+  # "AdvancedBot6_S3cret!"). With no {user} token it's a literal shared password (default, local dev).
+  [string]$Pass = "password",
   [switch]$Rated,                 # omit = unrated (test); -Rated = rated
   [string[]]$Only                 # optional: launch only these bot names
 )
@@ -33,7 +37,8 @@ $ladder = @(
 )
 
 function Launch($b) {
-  $a = @("-NoExit", "-File", "$here\run-gembot.ps1", "-User", $b.User, "-Pass", $Pass,
+  $pass = $Pass.Replace('{user}', $b.User)   # per-bot password from the shared template
+  $a = @("-NoExit", "-File", "$here\run-gembot.ps1", "-User", $b.User, "-Pass", $pass,
     "-Size", "$($b.Size)", "-Nodes", "$($b.Nodes)", "-Temperature", "$($b.Temp)",
     "-MovePool", "$($b.Pool)", "-ServerHost", $ServerHost, "-Port", "$Port")
   if ($Rated) { $a += "-Rated" }
