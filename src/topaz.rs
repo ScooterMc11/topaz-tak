@@ -992,6 +992,8 @@ fn play_game_tei<E: Evaluator + Default + Send>(
     let table = HashTable::new(init.hash_size);
     let mut position_hashes = Vec::new();
     let mut info = SearchInfo::new(init.max_depth, &table);
+    // RNG for softmax move-selection weakening (only consulted when init.temperature > 0).
+    let mut rng = topaz_tak::datagen::new_rng();
 
     loop {
         let message = receiver.recv()?;
@@ -1005,8 +1007,15 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                 if init.max_nodes > 0 {
                     info = info.set_max_nodes(init.max_nodes as u64, init.max_nodes as u64);
                 }
+                // Weakening needs a pool to sample from: widen MultiPV to at least 5 (cap 8) when a
+                // temperature is set, even if the caller left MultiPV at 1.
+                let pv_width = if init.temperature > 0.0 {
+                    init.multi_pv.max(5).min(8)
+                } else {
+                    init.multi_pv
+                };
                 info = info
-                    .set_multi_pv(init.multi_pv)
+                    .set_multi_pv(pv_width)
                     .with_hyper(init.hyper.clone())
                     .abort_depth(init.early_abort_depth);
                 info = info.input_stream(receiver.clone());
@@ -1044,13 +1053,17 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                 // let res = topaz_tak::search::search(&mut board, &mut eval, &mut info);
                 if let Some(outcome) = res {
                     println!("{}", outcome);
-                    println!(
-                        "bestmove {}",
-                        outcome
-                            .best_move()
-                            .expect("Could not find best move!")
-                            .trim_end_matches('*')
-                    );
+                    let best = outcome.best_move().expect("Could not find best move!");
+                    // Weakening knob: sample among the top root moves when a temperature is set.
+                    let chosen = if init.temperature > 0.0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_softmax(info.root_choices(), init.temperature, u)
+                            .map(|m| m.to_ptn::<E::Game>())
+                            .unwrap_or(best)
+                    } else {
+                        best
+                    };
+                    println!("bestmove {}", chosen.trim_end_matches('*'));
                 } else {
                     println!("Something went wrong, search failed!");
                 }
@@ -1102,6 +1115,7 @@ fn identify() {
     println!("option name MaxNodes type spin default -1 min -1 max 10000000");
     println!("option name AbortDepth type spin default 6 min 1 max 64");
     println!("option name MultiPV type spin default 1 min 1 max 8");
+    println!("option name Temperature type string default 0");
     if TUNING {
         println!("option name RFP type spin default 115 min 50 max 150");
         println!("option name FP type spin default 50 min 30 max 100");
@@ -1178,6 +1192,9 @@ fn tei_loop() {
             } else if name == "MultiPV" {
                 init.multi_pv = value.parse().unwrap();
                 println!("Setting MultiPV to {}", init.multi_pv);
+            } else if name == "Temperature" {
+                init.temperature = value.parse().unwrap();
+                println!("Setting Temperature to {}", init.temperature);
             } else if name == "RFP" {
                 init.hyper.rfp_margin = value.parse().unwrap();
             } else if name == "FP" {
@@ -1234,6 +1251,11 @@ struct PlaytakConfig {
     hash_mb: usize,
     /// Black's first-reply archetype weights (diagonal, adjacent, hug, gap-hug); see §4.7.
     black_opening_weights: Vec<f64>,
+    /// Engine-weakening softmax temperature over the top `move_pool` root moves (0 = off => always
+    /// play the best move). The ladder's lower levels raise this to play below the node-cap floor.
+    temperature: f64,
+    /// How many top root moves to sample among when `temperature > 0` (MultiPV width, capped at 8).
+    move_pool: usize,
 }
 
 impl PlaytakConfig {
@@ -1295,6 +1317,14 @@ impl PlaytakConfig {
                 })
                 .filter(|v| v.len() == 4)
                 .unwrap_or_else(|| vec![20.0, 25.0, 30.0, 25.0]),
+            temperature: get("PLAYTAK_TEMPERATURE")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0.0),
+            // MultiPV width is capped at 8 by the search's fixed-size per-PV arrays.
+            move_pool: get("PLAYTAK_MOVE_POOL")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(5)
+                .clamp(1, 8),
         }
     }
 
@@ -1334,6 +1364,8 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
     let mut board = E::Game::start_position().with_komi(komi);
     let table = HashTable::new(config.hash_mb * 1024 * 1024);
     let mut eval = E::default();
+    // RNG for softmax move-selection weakening (only consulted when config.temperature > 0).
+    let mut rng = topaz_tak::datagen::new_rng();
     'outer: loop {
         let message = server_recv.recv()?;
         match message {
@@ -1367,11 +1399,24 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                 if config.nodes > 0 {
                     info = info.set_max_nodes(config.nodes, config.nodes);
                 }
+                if config.temperature > 0.0 {
+                    info = info.set_multi_pv(config.move_pool);
+                }
                 let res = topaz_tak::search::multi_search(&mut board, &mut eval, &mut info, 1);
                 if let Some(outcome) = res {
-                    server_send
-                        .send(outcome.best_move().expect("could not find best move!"))
-                        .unwrap();
+                    // Weakening knob: when a temperature is set, sample among the top root moves
+                    // (info.root_choices) instead of always taking the best. Falls back to best.
+                    let chosen = if config.temperature > 0.0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_softmax(info.root_choices(), config.temperature, u)
+                            .map(|m| m.to_ptn::<E::Game>())
+                            .unwrap_or_else(|| {
+                                outcome.best_move().expect("could not find best move!")
+                            })
+                    } else {
+                        outcome.best_move().expect("could not find best move!")
+                    };
+                    server_send.send(chosen).unwrap();
                 } else {
                     println!("Something went wrong, search failed!");
                 }

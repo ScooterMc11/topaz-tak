@@ -51,6 +51,10 @@ pub struct GameInitializer {
     /// completes at least this depth). The default 6 imposes a ~depth-6 floor (~4k nodes on 6x6),
     /// so low `max_nodes` caps don't bite. Lower it (e.g. 1) to let small node caps take effect.
     pub early_abort_depth: usize,
+    /// Engine-weakening temperature for softmax move-selection over the top `multi_pv` root moves
+    /// (0 = off => always play the best move). Higher => more random among the top moves. Used to
+    /// space the bot ladder below the node-cap floor; see `search::select_softmax`.
+    pub temperature: f64,
 }
 
 #[cfg(feature = "evaluation")]
@@ -66,6 +70,7 @@ impl GameInitializer {
             multi_pv: 1,
             hyper: SearchHyper::default(),
             early_abort_depth: 6,
+            temperature: 0.0,
         }
     }
     pub fn get_board<E: eval::Evaluator + Default>(&self) -> (E::Game, E) {
@@ -109,6 +114,7 @@ impl std::default::Default for GameInitializer {
             multi_pv: 1,
             hyper: SearchHyper::default(),
             early_abort_depth: 6,
+            temperature: 0.0,
         }
     }
 }
