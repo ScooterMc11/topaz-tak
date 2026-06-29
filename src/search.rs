@@ -94,6 +94,8 @@ where
     let mut moves: [SmartMoveBuffer; 50] = core::array::from_fn(|_| SmartMoveBuffer::new(0));
     let is_multi_pv = info.multi_pv > 1 && info.main_thread;
     let mut outcomes: Vec<SearchOutcome<T>> = Vec::new();
+    // Per-depth (root move, score) list, snapshotted into info.root_choices when a depth completes.
+    let mut depth_choices: Vec<(GameMove, i32)> = Vec::new();
     'outer: for depth in 1..=info.max_depth {
         // Abort if we are unlikely to finish the search at this depth
         if depth >= info.early_abort_depth {
@@ -106,6 +108,7 @@ where
             }
         }
         info.forbidden_root_moves.clear();
+        depth_choices.clear();
         let num_pvs = info.multi_pv as usize;
         if solved[num_pvs - 1] {
             // Stop wasting time
@@ -165,6 +168,9 @@ where
                 }
                 break 'outer;
             }
+            if let Some(&root_move) = pv_moves.first() {
+                depth_choices.push((root_move, best_score));
+            }
             if pv_idx == 0 {
                 outcome = Some(SearchOutcome::new(
                     best_score,
@@ -208,10 +214,57 @@ where
                 solved[pv_idx] = true;
             }
         }
+        // This depth completed fully: record its top root moves+scores so a caller can sample
+        // among them (move-selection weakening) instead of always playing the best move.
+        info.root_choices = depth_choices.clone();
     }
     info.hist_moves.clear();
     info.counter_moves.clear();
     outcome
+}
+
+/// Pick a move from `choices` (each `(move, score)`, best first — i.e. the contents of
+/// `SearchInfo::root_choices`) by softmax sampling weighted by `score / temperature`. This is the
+/// engine-weakening knob used to build the bot ladder: a higher `temperature` spreads probability
+/// toward worse moves (more human-like inaccuracy), while the softmax exponentially suppresses
+/// catastrophic moves so the bot rarely outright blunders.
+///
+/// `uniform01` is a single uniform sample in `[0, 1)` supplied by the caller (keeps this RNG-free
+/// and deterministic to test). Returns the best move unchanged when weakening is off or unsafe:
+/// `temperature <= 0`, fewer than two choices, or a decided position (so a forced win/loss is never
+/// sampled away). Returns `None` only when `choices` is empty.
+pub fn select_softmax(
+    choices: &[(GameMove, i32)],
+    temperature: f64,
+    uniform01: f64,
+) -> Option<GameMove> {
+    let &(best, best_score) = choices.first()?;
+    if temperature <= 0.0
+        || choices.len() < 2
+        || best_score > WIN_SCORE - 10
+        || best_score < LOSE_SCORE + 10
+    {
+        return Some(best);
+    }
+    // Softmax over (score - best_score) / temperature; the shift keeps exp() in a safe range and
+    // makes the best move's weight 1.0.
+    let best_f = best_score as f64;
+    let weights: Vec<f64> = choices
+        .iter()
+        .map(|&(_, s)| (((s as f64) - best_f) / temperature).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if !(total > 0.0) {
+        return Some(best); // degenerate (underflow / NaN) -> fall back to best
+    }
+    let mut target = uniform01.clamp(0.0, 1.0) * total;
+    for (i, w) in weights.iter().enumerate() {
+        target -= w;
+        if target <= 0.0 {
+            return Some(choices[i].0);
+        }
+    }
+    Some(best) // floating-point rounding fallthrough
 }
 
 #[derive(Clone)]
@@ -920,6 +973,63 @@ mod test {
     use crate::eval::{Weights5, Weights6, LOSE_SCORE};
     use crate::transposition_table::*;
     use crate::{Position, TakBoard};
+    #[test]
+    fn softmax_selection() {
+        let board = Board6::new();
+        let m_best = GameMove::try_from_ptn("a1", &board).unwrap();
+        let m_second = GameMove::try_from_ptn("f6", &board).unwrap();
+
+        // Two equal-score moves at high temperature: the uniform sample chooses the bucket.
+        let equal = [(m_best, 100), (m_second, 100)];
+        assert_eq!(select_softmax(&equal, 200.0, 0.0), Some(m_best));
+        assert_eq!(select_softmax(&equal, 200.0, 0.99), Some(m_second));
+
+        // Temperature 0 (weakening off) always returns the best move.
+        let spread = [(m_best, 300), (m_second, -50)];
+        assert_eq!(select_softmax(&spread, 0.0, 0.99), Some(m_best));
+
+        // A decided (forced-win) best score is never sampled away, even at high temperature.
+        let winning = [(m_best, WIN_SCORE - 1), (m_second, 50)];
+        assert_eq!(select_softmax(&winning, 500.0, 0.99), Some(m_best));
+
+        // Edge cases: empty -> None; a single choice -> that choice.
+        assert_eq!(select_softmax(&[], 100.0, 0.5), None);
+        assert_eq!(select_softmax(&[(m_best, 0)], 100.0, 0.5), Some(m_best));
+    }
+    #[test]
+    fn root_choices_populated_and_sampled() {
+        // A normal 6x6 midgame position with many legal moves.
+        let tps = "2,x,21C,x3/2S,1,2,x,1,x/112,x,1,2,2,x/1,1112S,1,12C,1,x/1,x,2,2,x2/1,1,x4 1 18";
+        let mut board = Board6::try_from_tps(tps).unwrap();
+        let table = HashTable::new(1 << 20);
+        let mut eval = crate::eval::NNUE6::default();
+        let mut info = SearchInfo::new(20, &table)
+            .set_max_nodes(5000, 5000)
+            .abort_depth(1)
+            .set_multi_pv(5)
+            .quiet(true);
+        let _ = search(&mut board, &mut eval, &mut info);
+
+        // A completed multi-PV depth fills root_choices with several distinct moves, best first.
+        let choices = info.root_choices().to_vec();
+        assert!(
+            choices.len() >= 2,
+            "expected multiple root choices, got {}",
+            choices.len()
+        );
+        assert!(
+            choices[0].1 >= choices[choices.len() - 1].1,
+            "root_choices not best-first"
+        );
+
+        // High temperature must, for at least some uniform samples, pick a non-best move.
+        let best = choices[0].0;
+        let picked_non_best = (0..20).any(|i| {
+            let u = i as f64 / 20.0;
+            select_softmax(&choices, 500.0, u) != Some(best)
+        });
+        assert!(picked_non_best, "high temperature never picked a non-best move");
+    }
     #[test]
     fn rep_detection() {
         let tps = "2,1,2,2,1,2/2S,1,1,1221C,1,1/112111112S,x2,112S,2,2/1,121S,112C,12,2,2/x2,2,221,2,2/1,1,2,1,1,1 1 38";

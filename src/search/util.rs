@@ -35,6 +35,10 @@ pub struct SearchInfo<'a> {
     pub(crate) main_thread: bool,
     pub(crate) multi_pv: usize,
     pub(crate) forbidden_root_moves: SimpleMoveList<GameMove>,
+    /// The deepest fully-completed iteration's root moves with their scores, best first (up to
+    /// `multi_pv` entries). Lets a caller weaken the engine by sampling among the top moves instead
+    /// of always taking the best (see `select_softmax`). Empty until the first depth completes.
+    pub(crate) root_choices: Vec<(GameMove, i32)>,
 }
 
 impl<'a> SearchInfo<'a> {
@@ -65,7 +69,12 @@ impl<'a> SearchInfo<'a> {
             main_thread: true,
             multi_pv: 1,
             forbidden_root_moves: SimpleMoveList::new(),
+            root_choices: Vec::new(),
         }
+    }
+    /// The deepest completed iteration's root moves with scores, best first (see field docs).
+    pub fn root_choices(&self) -> &[(GameMove, i32)] {
+        &self.root_choices
     }
     pub fn set_multi_pv(mut self, num_pvs: usize) -> Self {
         self.multi_pv = std::cmp::max(1, num_pvs);

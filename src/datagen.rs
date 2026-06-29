@@ -120,7 +120,7 @@ fn result_for(white_to_move: bool, outcome: GameResult) -> u8 {
     }
 }
 
-pub(crate) fn new_rng() -> Xoshiro256PlusPlus {
+pub fn new_rng() -> Xoshiro256PlusPlus {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("failed to seed rng");
     Xoshiro256PlusPlus::from_seed(seed)
