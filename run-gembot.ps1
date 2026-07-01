@@ -24,6 +24,9 @@ param(
   # ladder tells you (depth-quantized, so expect a few discrete rungs).
   [int]$Nodes = $(if ($Size -eq 5) { 220 } else { 55 }),
   [int]$AbortDepth = 1,
+  # Seek base time in seconds; the increment scales with move number (the "+n"). Per-size TC:
+  # 5x5 = 7+n (420s base), 6x6 = 10+n (600s base).
+  [int]$Time = $(if ($Size -eq 5) { 420 } else { 600 }),
   # Ladder weakening (provisional, calibrated 2026-06-29; live ladder is the real anchor). 0 = full
   # strength (Advanced). Higher Temperature => weaker via softmax move-selection over the top MovePool
   # root moves. See run-ladder.ps1 for the per-level values.
@@ -46,17 +49,17 @@ $env:PLAYTAK_TEMPERATURE = "$Temperature"
 $env:PLAYTAK_MOVE_POOL = "$MovePool"
 $env:PLAYTAK_HASH_MB = "$HashMb"
 $env:PLAYTAK_OPENING = "1"        # Double Black Stack
-$env:PLAYTAK_TIME = "180"         # 3 min base
-$env:PLAYTAK_INC = "1"            # +1s * moveNum (with scaling)
-$env:PLAYTAK_INC_SCALES = "1"     # 3+n increment scaling
+$env:PLAYTAK_TIME = "$Time"       # base time (s): 5x5=420 (7+n), 6x6=600 (10+n)
+$env:PLAYTAK_INC = "1"            # base increment; +1s * moveNum with scaling
+$env:PLAYTAK_INC_SCALES = "1"     # increment scales with move number (the "+n")
 $env:PLAYTAK_COLOR = "A"          # accept either color
 $env:PLAYTAK_UNRATED = $(if ($Rated) { "0" } else { "1" })
 
 $bin = Join-Path $PSScriptRoot "target\release\topaz.exe"
 if (-not (Test-Path $bin)) { Write-Error "topaz.exe not found at $bin - build it first (cargo build --release)"; exit 1 }
 
-Write-Host ("Launching {0}: size {1}, nodes {2}, abort {3}, temp {4}, pool {5}, {6}:{7}, rated={8}" -f `
-    $User, $Size, $Nodes, $AbortDepth, $Temperature, $MovePool, $ServerHost, $Port, $Rated.IsPresent)
+Write-Host ("Launching {0}: size {1}, nodes {2}, abort {3}, temp {4}, pool {5}, time {6}s, {7}:{8}, rated={9}" -f `
+    $User, $Size, $Nodes, $AbortDepth, $Temperature, $MovePool, $Time, $ServerHost, $Port, $Rated.IsPresent)
 while ($true) {
   & $bin playtak
   Write-Host "$User exited (code $LASTEXITCODE); restarting in 5s..."
