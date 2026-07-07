@@ -107,8 +107,11 @@ where
         }
         info.forbidden_root_moves.clear();
         let num_pvs = info.multi_pv as usize;
-        if solved[num_pvs - 1] {
-            // Stop wasting time
+        if solved[0] {
+            // The best move is a proven win/loss; deeper search can't change the
+            // recommendation. (Must key off the best PV, not the worst-of-top-N: a
+            // losing tail move is normal when a threat is on the board and must not
+            // abort the whole search.)
             break;
         }
         for pv_idx in 0..num_pvs {
