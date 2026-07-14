@@ -86,6 +86,14 @@ where
     // let mut node_counts = vec![1];
     info.start_search(board.ply());
     eval.set_tempo_offset(info.hyper.tempo_bonus);
+    // Pick komi-specialized weights once per search (before any eval); helper threads run their own
+    // search() so each configures its own evaluator. No-op for komi-agnostic evaluators.
+    eval.set_komi(board.komi());
+    if info.main_thread && !info.quiet {
+        // TEI-safe diagnostic: shows the half-komi the engine is actually searching with, so a
+        // GUI/komi wiring problem is visible in the engine log.
+        println!("info string half_komi {}", board.komi());
+    }
     let mut alphas = [-1_000_000; 8];
     let mut betas = [1_000_000; 8];
     let mut solved = [false; 8];

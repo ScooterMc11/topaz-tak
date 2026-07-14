@@ -23,6 +23,16 @@ pub static NNUE: Network = unsafe {
     std::mem::transmute(*bytes)
 };
 
+/// 6x6 net specialized for 2-komi (half_komi == 4) games. Staged into OUT_DIR by build.rs: the real
+/// quantised-2-komi.bin when present, otherwise a copy of the standard quantised.bin as a graceful
+/// fallback (so a build without the 2-komi file still works and 2-komi games just use the standard
+/// net). Same `Network` layout as NNUE, so the transmute is identical.
+pub static NNUE_2KOMI: Network = unsafe {
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/quantised-2-komi.bin"));
+    assert!(bytes.len() == std::mem::size_of::<Network>());
+    std::mem::transmute(*bytes)
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidPiece(pub u8);
 
@@ -346,10 +356,15 @@ pub struct NNUE6 {
     white: (Incremental, Incremental),
     black: (Incremental, Incremental),
     pub(crate) tempo_offset: i32,
+    /// The weights this evaluator uses. Fixed for the evaluator's lifetime because the incremental
+    /// accumulators (`white`/`black`) are built against it and cannot be swapped mid-search. Chosen
+    /// by `set_net_for_komi` at search start; defaults to the standard net.
+    net: &'static Network,
 }
 
 impl NNUE6 {
     pub fn incremental_eval(&mut self, takboard: BoardData) -> i32 {
+        let net = self.net;
         let (ours, theirs) = build_features(takboard);
         let (old_ours, old_theirs) = if takboard.white_to_move {
             (&self.white.0, &self.white.1)
@@ -358,26 +373,39 @@ impl NNUE6 {
         };
         // Ours
         let mut ours_acc = Accumulator::from_old(&old_ours.vec);
-        ours.compute_diff(&old_ours.state, &mut ours_acc);
+        ours.compute_diff(&old_ours.state, &mut ours_acc, net);
         let ours = Incremental {
             state: ours,
             vec: ours_acc,
         };
         // Theirs
         let mut theirs_acc = Accumulator::from_old(&old_theirs.vec);
-        theirs.compute_diff(&old_theirs.state, &mut theirs_acc);
+        theirs.compute_diff(&old_theirs.state, &mut theirs_acc, net);
         let theirs = Incremental {
             state: theirs,
             vec: theirs_acc,
         };
         // Output
-        let eval = NNUE.evaluate(&ours.vec, &theirs.vec, ours.state.clone().into_iter());
+        let eval = net.evaluate(&ours.vec, &theirs.vec, ours.state.clone().into_iter());
         if takboard.white_to_move {
             self.white = (ours, theirs);
         } else {
             self.black = (ours, theirs);
         }
         eval
+    }
+    /// Select the weights based on the game's half-komi and reset the incremental state to match.
+    /// `half_komi == 4` (2 komi) uses the komi-specialized net; every other value uses the standard
+    /// net. Must be called before any eval, since the accumulators are built against a single net
+    /// and cannot be swapped mid-search. Preserves the current `tempo_offset`.
+    pub fn set_net_for_komi(&mut self, half_komi: u8) {
+        let net: &'static Network = if half_komi == 4 { &NNUE_2KOMI } else { &NNUE };
+        *self = Self {
+            white: (Incremental::fresh_empty(net), Incremental::fresh_empty(net)),
+            black: (Incremental::fresh_empty(net), Incremental::fresh_empty(net)),
+            tempo_offset: self.tempo_offset,
+            net,
+        };
     }
     #[cfg(test)]
     pub(crate) fn manual_eval(takboard: BoardData) -> i32 {
@@ -401,6 +429,7 @@ impl Default for NNUE6 {
                 Incremental::fresh_empty(&NNUE),
             ),
             tempo_offset: 100,
+            net: &NNUE,
         }
     }
 }
@@ -560,7 +589,7 @@ impl IncrementalState {
         let b_val = 1 << (val % 64);
         self.bitset[b_idx] |= b_val
     }
-    pub fn compute_diff(&self, old: &Self, acc: &mut Accumulator) {
+    pub fn compute_diff(&self, old: &Self, acc: &mut Accumulator, net: &Network) {
         for (idx, (n, o)) in self
             .bitset
             .iter()
@@ -574,11 +603,11 @@ impl IncrementalState {
                 let mut add = d & n; // Difference and New
                 while sub != 0 {
                     let bit_idx = pop_lowest(&mut sub);
-                    acc.remove_feature(idx * 64 + bit_idx as usize, &NNUE);
+                    acc.remove_feature(idx * 64 + bit_idx as usize, net);
                 }
                 while add != 0 {
                     let bit_idx = pop_lowest(&mut add);
-                    acc.add_feature(idx * 64 + bit_idx as usize, &NNUE);
+                    acc.add_feature(idx * 64 + bit_idx as usize, net);
                 }
             }
         }
@@ -649,6 +678,23 @@ mod tests {
         assert_eq!("2,1,2,2,2,2/x,212S,2,2,1,x/1,1C,1,2,1,x/1S,x,21,1S,x,x/12,12S,1,1S,2112C,1/1,1,2,2,2,x 1 4", &syms[5]);
         assert_eq!("2,2,2,2,1,2/x,1,2,2,212S,x/x,1,2,1,1C,1/x,x,1S,21,x,1S/1,2112C,1S,1,12S,12/x,2,2,2,1,1 1 4", &syms[6]);
         assert_eq!("1,1,2,2,2,x/12,12S,1,1S,2112C,1/1S,x,21,1S,x,x/1,1C,1,2,1,x/x,212S,2,2,1,x/2,1,2,2,2,2 1 4", &syms[7]);
+    }
+    #[test]
+    fn komi_selects_net() {
+        use super::{Network, NNUE, NNUE6, NNUE_2KOMI};
+        // Compare by address: NNUE and NNUE_2KOMI are distinct statics even in a fallback build
+        // where their bytes happen to be identical, so this checks the selection logic itself.
+        let ptr = |n: &'static Network| n as *const Network;
+        let mut e = NNUE6::default();
+        assert_eq!(ptr(e.net), ptr(&NNUE), "default uses the standard net");
+        e.tempo_offset = 123; // must survive net selection
+        e.set_net_for_komi(0);
+        assert_eq!(ptr(e.net), ptr(&NNUE), "komi 0 -> standard net");
+        e.set_net_for_komi(2);
+        assert_eq!(ptr(e.net), ptr(&NNUE), "1 komi -> standard net");
+        e.set_net_for_komi(4);
+        assert_eq!(ptr(e.net), ptr(&NNUE_2KOMI), "2 komi (half_komi 4) -> specialized net");
+        assert_eq!(e.tempo_offset, 123, "tempo_offset preserved across selection");
     }
     // #[test]
     // fn check_repr() {

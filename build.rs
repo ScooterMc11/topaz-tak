@@ -35,4 +35,26 @@ fn main() {
              (4x4 NNUE eval is disabled until a real net is provided)"
         );
     }
+
+    // 2-komi 6x6 net (used for half_komi == 4 games). Same idea, but the fallback is the STANDARD
+    // 6x6 net -- not zeros -- so a build without the 2-komi file still works and 2-komi games simply
+    // use the normal net. quantised.bin is required anyway (embedded directly by incremental.rs).
+    let staged_2komi = Path::new(&out_dir).join("quantised-2-komi.bin");
+    let source_2komi = Path::new("src/quantised-2-komi.bin");
+    let standard = Path::new("src/quantised.bin");
+    println!("cargo:rerun-if-changed=src/quantised-2-komi.bin");
+    println!("cargo:rerun-if-changed=src/quantised.bin");
+    if source_2komi.exists() {
+        std::fs::copy(&source_2komi, &staged_2komi)
+            .expect("failed to stage src/quantised-2-komi.bin into OUT_DIR");
+    } else if standard.exists() {
+        std::fs::copy(&standard, &staged_2komi)
+            .expect("failed to stage fallback quantised.bin as quantised-2-komi.bin");
+        println!(
+            "cargo:warning=src/quantised-2-komi.bin not found; falling back to the standard \
+             quantised.bin (2-komi games will use the standard 6x6 net)"
+        );
+    }
+    // If neither exists, leave it absent: incremental.rs's include_bytes!(\"../quantised.bin\") will
+    // surface the canonical missing-net error.
 }
