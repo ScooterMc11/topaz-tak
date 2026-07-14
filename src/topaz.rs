@@ -986,7 +986,7 @@ impl TimeLeft {
 
 fn play_game_tei<E: Evaluator + Default + Send>(
     receiver: Receiver<TeiCommand>,
-    init: GameInitializer,
+    mut init: GameInitializer,
 ) -> Result<()> {
     let (mut board, mut eval) = init.get_board::<E>();
     let table = HashTable::new(init.hash_size);
@@ -1070,6 +1070,12 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                         position_hashes.push(board.hash());
                     }
                 }
+            }
+            TeiCommand::SetKomi(k) => {
+                // Applied to init; the next Position rebuilds the board with this komi, so the
+                // subsequent search selects the matching net and opening rule.
+                init.komi = k;
+                println!("info string set komi to {}", k);
             }
             TeiCommand::NewGame(_size) => {
                 info.clear_tt();
@@ -1163,6 +1169,9 @@ fn tei_loop() {
             if name == "HalfKomi" {
                 init.komi = value.parse().unwrap();
                 println!("Setting komi to {}", init.komi);
+                // Forward to the already-spawned worker so an in-UI game switch (no reconnect)
+                // updates komi -> net + opening rule, instead of reusing the previous game's.
+                sender.send(TeiCommand::SetKomi(init.komi)).ok();
             } else if name == "Threads" {
                 init.num_threads = value.parse().unwrap();
                 println!("Setting threads to {}", init.num_threads);

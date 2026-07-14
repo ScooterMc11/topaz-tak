@@ -350,6 +350,10 @@ pub enum TeiCommand {
     Go(TeiGo),
     Position(String),
     NewGame(usize),
+    /// New half-komi for the running game worker. Sent by the TEI loop when `setoption HalfKomi`
+    /// is processed, so a worker (spawned once per connection) picks up a komi change when the GUI
+    /// switches games without reconnecting. Carries the half-komi value.
+    SetKomi(u8),
 }
 
 pub fn execute_moves_check_valid(board: &mut Board6, ptn_slice: &[&str]) -> Result<Vec<GameMove>> {
