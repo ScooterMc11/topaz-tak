@@ -28,6 +28,10 @@ pub trait Evaluator {
     type Game: TakBoard + Send;
     fn evaluate(&mut self, game: &Self::Game, depth: usize) -> Eval;
     fn set_tempo_offset(&mut self, tempo: Eval);
+    /// Select weights for the game's half-komi. Default is a no-op (most evaluators are
+    /// komi-agnostic); NNUE6 overrides it to swap to a komi-specialized net. Called once at
+    /// search start.
+    fn set_komi(&mut self, _half_komi: u8) {}
 }
 
 impl Evaluator for NNUE6 {
@@ -44,6 +48,9 @@ impl Evaluator for NNUE6 {
     }
     fn set_tempo_offset(&mut self, tempo: Eval) {
         self.tempo_offset = tempo;
+    }
+    fn set_komi(&mut self, half_komi: u8) {
+        self.set_net_for_komi(half_komi);
     }
 }
 

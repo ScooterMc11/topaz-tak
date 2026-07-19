@@ -1,0 +1,9 @@
+{
+  "config": {"depth": 10, "plies": 6, "cp_bound": 25, "rel_bound": 10, "cp_bound_internal": 100, "rel_bound_internal": 40, "relative_to_top": true, "require_both": true},
+  "mode": "both",
+  "dedup": "distinct end-state positions (D4 symmetry-collapsed)",
+  "rulesets": {
+    "black_stack": {"label": "Black Stack", "archetypes": [{"name": "diagonal corners", "dead": false, "opening_cp": 15.5, "abs": 0, "rel": 0, "both": 1202}, {"name": "adjacent corners", "dead": false, "opening_cp": 1.8, "abs": 0, "rel": 0, "both": 1261}, {"name": "hug", "dead": false, "opening_cp": -9.8, "abs": 0, "rel": 0, "both": 1579}, {"name": "gap hug", "dead": false, "opening_cp": 9.5, "abs": 0, "rel": 0, "both": 3130}]},
+    "two_komi": {"label": "2-Komi", "archetypes": [{"name": "diagonal corners", "dead": false, "opening_cp": 21.2, "abs": 0, "rel": 0, "both": 1138}, {"name": "adjacent corners", "dead": false, "opening_cp": 19.5, "abs": 0, "rel": 0, "both": 1397}, {"name": "hug", "dead": true, "opening_cp": 33.2, "abs": 0, "rel": 0, "both": 0}]}
+  }
+}

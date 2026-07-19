@@ -46,7 +46,9 @@ const RESERVE_INIT: usize = 15;
 const DATA_LEN: usize = 30;
 
 pub static NNUE4: Network = unsafe {
-    let bytes = include_bytes!("../quantised4.bin");
+    // Staged into OUT_DIR by build.rs (the real net when src/quantised4.bin exists, else a
+    // zero-filled placeholder) so the crate builds without the in-progress 4x4 weights present.
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/quantised4.bin"));
     assert!(bytes.len() == std::mem::size_of::<Network>());
     std::mem::transmute(*bytes)
 };

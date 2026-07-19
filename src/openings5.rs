@@ -73,6 +73,19 @@ const CORNERS: [&str; 4] = ["a1", "a5", "e1", "e5"];
 
 pub const NUM_ARCHETYPES: usize = 5;
 
+/// Index of the center-stack archetype (see `archetype_name`). Self-play showed it is too
+/// Black-favoured to be a viable line, so books for training/balance work exclude it and use only
+/// the 4 corner archetypes. Mirrors the 6x6 `openings::CENTER_STACK`.
+pub const CENTER_STACK: usize = 4;
+
+/// Uniform weights over the 4 corner archetypes, with center-stack zeroed out. Black-stack mode
+/// only (standard mode has no center-stack archetype).
+pub fn corner_archetype_weights() -> Vec<f64> {
+    let mut w = vec![1.0; NUM_ARCHETYPES];
+    w[CENTER_STACK] = 0.0;
+    w
+}
+
 /// Human-readable name for an archetype index (matches pick_instance's ordering).
 pub fn archetype_name(i: usize) -> &'static str {
     match i {
@@ -138,6 +151,9 @@ pub struct OpeningsConfig {
     /// Standard-Tak mode: ply 1 is a single swapped flat instead of the `2xx` double-black-stack,
     /// and only the diagonal-corner / adjacent-corner / hug archetypes are used.
     pub standard: bool,
+    /// Exclude the center-stack archetype, emitting only the 4 corner archetypes. No-op in
+    /// `standard` mode. The 5x5 4-archetype ceiling is well under the ~29,750 all-archetype ceiling.
+    pub no_center_stack: bool,
 }
 
 impl Default for OpeningsConfig {
@@ -147,6 +163,7 @@ impl Default for OpeningsConfig {
             tps_path: "5s_black_stack_openings.tps".to_string(),
             ptn_path: "5s_black_stack_openings.ptn".to_string(),
             standard: false,
+            no_center_stack: false,
         }
     }
 }
@@ -402,13 +419,17 @@ pub fn generate_weighted(
     let mut attempts = 0usize;
 
     while out.len() < count {
-        // Choose this slot's archetype by smooth weighted round-robin.
+        // Choose this slot's archetype by smooth weighted round-robin. Archetypes with a
+        // non-positive weight are excluded outright (see 6x6 openings.rs for the round-robin bug
+        // this filter avoids: a stationary 0-weight credit would eventually win as others go
+        // negative).
         for (a, w) in weights.iter().enumerate() {
             credit[a] += w;
         }
         let pick = (0..num_arch)
+            .filter(|&a| weights[a] > 0.0)
             .max_by(|&x, &y| credit[x].partial_cmp(&credit[y]).unwrap())
-            .unwrap();
+            .expect("at least one archetype must have a positive weight");
         credit[pick] -= total_w;
 
         // Generate a unique opening of that archetype (retry on dup/collision).
@@ -441,7 +462,11 @@ pub fn generate(count: usize, standard: bool) -> Vec<(String, String, usize)> {
 
 /// Generate the book and write both files. Returns the number of unique openings written.
 pub fn run(cfg: OpeningsConfig) -> io::Result<usize> {
-    let openings = generate(cfg.count, cfg.standard);
+    let openings = if cfg.no_center_stack && !cfg.standard {
+        generate_weighted(cfg.count, false, &corner_archetype_weights())
+    } else {
+        generate(cfg.count, cfg.standard)
+    };
 
     // Self-check: every emitted TPS must parse back through Topaz's own parser.
     for (tps, _, _) in &openings {
@@ -532,8 +557,19 @@ mod test {
             tps_path: std::env::temp_dir().join("topaz5_test_openings.tps").to_string_lossy().into_owned(),
             ptn_path: std::env::temp_dir().join("topaz5_test_openings.ptn").to_string_lossy().into_owned(),
             standard: false,
+            no_center_stack: false,
         };
         let n = run(cfg).unwrap();
         assert_eq!(n, 50);
+    }
+
+    #[test]
+    fn no_center_stack_excludes_center_archetype() {
+        let openings = generate_weighted(150, false, &corner_archetype_weights());
+        assert_eq!(openings.len(), 150);
+        assert!(
+            openings.iter().all(|(_, _, arch)| *arch != CENTER_STACK),
+            "corner-only 5x5 book must contain no center-stack openings"
+        );
     }
 }

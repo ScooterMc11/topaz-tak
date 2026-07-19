@@ -23,9 +23,9 @@ use crate::board::{Board6, TakBoard};
 use crate::eval::{build_nn_repr, BoardData, NNUE6};
 use crate::search::{search, SearchInfo};
 use crate::transposition_table::HashTable;
-use crate::{GameResult, Position};
+use crate::{Color, GameMove, GameResult, Position};
 
-use rand_core::SeedableRng;
+use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -51,9 +51,20 @@ pub struct DataGenConfig {
     pub threads: usize,
     /// Search node cap per move (datagen wants fast, shallow searches).
     pub max_nodes: u64,
-    /// Number of random plies at the start of each game for opening diversity (ply 0's only legal
-    /// moves are the forced double placements, so this also randomises White's opening square).
+    /// Number of random **flat** opening plies at the start of each game, for diversity (ply 1's
+    /// only legal moves are the forced double placements, so this also randomises White's opening
+    /// square unless `corner_open` pins it). Ignored in book mode.
     pub random_plies: usize,
+    /// Pin White's opening double-black-stack to a random corner instead of a random square, then
+    /// play `random_plies - 1` further random flats (so `random_plies` stays the *total* opening
+    /// ply count — note this differs from `balance`, where the corner open is an extra ply on top).
+    /// A uniformly random ply 1 puts the stack on a corner only 4 times in 36; off-corner stacks
+    /// exert far more influence and skew the data toward Black. Ignored in book mode.
+    pub corner_open: bool,
+    /// If set, a TPS opening book (one position per line). Each position seeds exactly one game,
+    /// deterministically, so the **book size becomes the game count** and `num_games` /
+    /// `random_plies` / `corner_open` are all ignored. Mirrors `balance --book`.
+    pub book_path: Option<String>,
     /// Output `.bin` path.
     pub output: String,
     /// Transposition-table size (entries) per worker thread.
@@ -67,6 +78,8 @@ impl Default for DataGenConfig {
             threads: 4,
             max_nodes: 5000,
             random_plies: 6,
+            corner_open: false,
+            book_path: None,
             output: "data.bin".to_string(),
             tt_size: 1 << 20,
         }
@@ -127,8 +140,64 @@ pub fn new_rng() -> Xoshiro256PlusPlus {
 }
 
 /// Play and serialize `num_games` games, sending finished chunks to the writer thread.
+/// Read a TPS opening book (one position per line, blanks ignored).
+fn load_book(path: &str) -> io::Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("empty opening book: {path}"),
+        ));
+    }
+    Ok(lines)
+}
+
+/// Build a game's starting board. In book mode, start from book entry `idx` (played exactly once —
+/// the search is deterministic, so re-using an opening would just re-generate an identical game).
+/// Otherwise build the opening from random flat plies, optionally pinning ply 1 to a corner.
+fn start_board(
+    book: &Option<Arc<Vec<String>>>,
+    idx: usize,
+    cfg: &DataGenConfig,
+    rng: &mut impl RngCore,
+) -> Board6 {
+    if let Some(book) = book {
+        return Board6::try_from_tps(&book[idx]).expect("datagen book contained an invalid tps");
+    }
+
+    let mut board = Board6::new(); // komi defaults to 0
+    let mut plies = cfg.random_plies;
+
+    // Pin White's opening double-black-stack to a random corner. All four corners are symmetric,
+    // so the choice among them only averages out per-square quirks in the net. This consumes ply 1.
+    if cfg.corner_open && plies > 0 {
+        const CORNERS: [&str; 4] = ["2a1", "2f1", "2a6", "2f6"];
+        let mv = GameMove::try_from_ptn_m(CORNERS[(rng.next_u32() % 4) as usize], 6, Color::White)
+            .expect("valid corner double-placement");
+        board.do_move(mv);
+        plies -= 1;
+    }
+
+    // Random **flat** opening plies (no walls/caps/spreads — those are not realistic openings and
+    // only distort the training distribution). The forced `2xx` at ply 1 is itself a flat placement,
+    // so it is preserved when `corner_open` is off.
+    for _ in 0..plies {
+        if board.game_result().is_some() {
+            break;
+        }
+        board.do_random_flat_move(rng);
+    }
+    board
+}
+
 fn worker(
-    num_games: usize,
+    games: std::ops::Range<usize>,
+    book: Option<Arc<Vec<String>>>,
     cfg: &DataGenConfig,
     tx: mpsc::Sender<Vec<u8>>,
     games_done: &AtomicU64,
@@ -140,18 +209,10 @@ fn worker(
     // (snapshot, side-to-move-relative score) recorded before each played move.
     let mut positions: Vec<(BoardData, i16)> = Vec::new();
 
-    for _ in 0..num_games {
+    for idx in games {
         table.clear();
         positions.clear();
-        let mut board = Board6::new(); // komi defaults to 0
-
-        // Random opening for diversity (includes the forced ply-0 double placement).
-        for _ in 0..cfg.random_plies {
-            if board.game_result().is_some() {
-                break;
-            }
-            board.do_random_move(&mut rng);
-        }
+        let mut board = start_board(&book, idx, cfg, &mut rng);
 
         // Play out, recording each searched position.
         while board.game_result().is_none() {
@@ -206,10 +267,40 @@ fn worker(
 pub fn run(cfg: DataGenConfig) -> io::Result<()> {
     assert!(cfg.threads >= 1, "need at least one thread");
     let start = Instant::now();
-    println!(
-        "datagen: {} games, {} threads, {} nodes/move, {} random plies -> {}",
-        cfg.num_games, cfg.threads, cfg.max_nodes, cfg.random_plies, cfg.output
-    );
+
+    // Book mode: every position seeds exactly one game, so the book size IS the game count.
+    let book: Option<Arc<Vec<String>>> = match cfg.book_path.as_deref() {
+        Some(path) => Some(Arc::new(load_book(path)?)),
+        None => None,
+    };
+    let total_games = match &book {
+        Some(b) => b.len(),
+        None => cfg.num_games,
+    };
+
+    match &book {
+        Some(b) => println!(
+            "datagen: {} book positions from {} (1 deterministic game each), {} threads, {} nodes/move -> {}",
+            b.len(),
+            cfg.book_path.as_deref().unwrap_or(""),
+            cfg.threads,
+            cfg.max_nodes,
+            cfg.output
+        ),
+        None => println!(
+            "datagen: {} games, {} threads, {} nodes/move, {} random flat plies{} -> {}",
+            total_games,
+            cfg.threads,
+            cfg.max_nodes,
+            cfg.random_plies,
+            if cfg.corner_open {
+                ", White opens in a corner"
+            } else {
+                ""
+            },
+            cfg.output
+        ),
+    }
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let out_path = cfg.output.clone();
@@ -227,20 +318,26 @@ pub fn run(cfg: DataGenConfig) -> io::Result<()> {
     let games_done = Arc::new(AtomicU64::new(0));
     let positions_done = Arc::new(AtomicU64::new(0));
 
-    let base = cfg.num_games / cfg.threads;
-    let extra = cfg.num_games % cfg.threads;
+    // Contiguous index ranges: in book mode these index the book, so every opening is used exactly
+    // once across all workers.
+    let base = total_games / cfg.threads;
+    let extra = total_games % cfg.threads;
     let mut handles = Vec::new();
+    let mut next = 0usize;
     for t in 0..cfg.threads {
-        let games = base + if t < extra { 1 } else { 0 };
-        if games == 0 {
+        let count = base + if t < extra { 1 } else { 0 };
+        let range = next..next + count;
+        next += count;
+        if count == 0 {
             continue;
         }
         let tx = tx.clone();
         let cfg = cfg.clone();
+        let book = book.clone();
         let games_done = games_done.clone();
         let positions_done = positions_done.clone();
         handles.push(thread::spawn(move || {
-            worker(games, &cfg, tx, &games_done, &positions_done);
+            worker(range, book, &cfg, tx, &games_done, &positions_done);
         }));
     }
     drop(tx);
@@ -410,6 +507,171 @@ pub fn summarize_file(path: &str) -> io::Result<String> {
         "positions={total} results[L/D/W]={:?} score=[{},{}] max_stack_bytes={max_data} invalid={invalid}{trunc}",
         wdl, smin, smax
     ))
+}
+
+/// Analyse the **eval calibration** of a "TAK6" dataset: does the net's score at a position predict
+/// the actual game outcome, and — crucially — is there a systematic White/Black skew?
+///
+/// Every entry stores a side-to-move-relative search `score` and the STM-relative game `result`.
+/// A White/Black bias is invisible in the STM frame (it cancels as the mover alternates), so we
+/// convert **both** to a fixed **White frame** and bin positions by the net's White-frame eval,
+/// then measure White's actual score in each bin. The eval where White actually scores 50% is the
+/// key number:
+///   - ≈ 0  → the net is calibrated (its zero-point is a true 50/50 position);
+///   - < 0  → the net **over-favours Black**: it scores genuinely even positions as Black-ahead by
+///            that many cp (this is the skew we're hunting);
+///   - > 0  → the net over-favours White.
+///
+/// Bins also print the sigmoid-implied win% (`sigmoid(internal_score / 400)`) next to the actual
+/// win%, so a *scale* problem (right zero-point, wrong slope) is visible as a consistent
+/// steeper/flatter actual curve rather than a shifted crossover.
+///
+/// `score` is internal (SCALE = 400/pawn); displayed "cp" = internal / 4, matching the engine's
+/// `info … score cp` output. Streams the file in O(1) memory, so it scales to the 11 GB datasets.
+pub fn calibrate_file(path: &str) -> io::Result<String> {
+    use std::collections::BTreeMap;
+
+    // Displayed-cp bin width and tail clamp; binning is done in internal units (= 4× displayed) to
+    // avoid a double round-off. Use floor division (`div_euclid`) so the zero boundary is clean:
+    // plain `/` truncates toward zero, which would make the bin at 0 straddle it (double width) and
+    // mislabel every negative bin.
+    const BIN_CP: i32 = 25;
+    const CLAMP_CP: i32 = 300;
+    const BIN_INT: i32 = BIN_CP * 4; // internal score units per bin
+    const CLAMP_INT: i32 = CLAMP_CP * 4;
+    const EVAL_SCALE: f64 = 400.0; // internal score → win prob via sigmoid(score / EVAL_SCALE)
+
+    // bin index (in displayed cp / BIN_CP) → (count, white_result_sum, internal_score_sum)
+    let mut bins: BTreeMap<i32, (u64, f64, f64)> = BTreeMap::new();
+    let mut total = 0u64;
+    let mut white_sum = 0.0f64;
+    let mut truncated = false;
+
+    let mut f = BufReader::new(File::open(path)?);
+    let mut hdr = [0u8; CHUNK_HEADER_SIZE];
+    loop {
+        match f.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        if magic != TAK_MAGIC {
+            return Ok(format!("ERROR: bad chunk magic (corrupt file); positions read so far={total}"));
+        }
+        let chunk_size = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; chunk_size];
+        match f.read_exact(&mut body) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                truncated = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        let mut i = 0;
+        while i + ENTRY_HEADER_SIZE <= body.len() {
+            let white_to_move = body[i + 2] != 0;
+            let score = i16::from_le_bytes([body[i + 4], body[i + 5]]) as i32;
+            let result = body[i + 6];
+            let data_len = body[i + 8] as usize;
+            let plys_len = body[i + 9] as usize;
+            let entry_end = i + ENTRY_HEADER_SIZE + data_len + plys_len * 4;
+            if entry_end > body.len() {
+                break;
+            }
+            i = entry_end;
+
+            // Skip mate-coded / invalid scores (the trainer filters |score| > 9999 too).
+            if result > 2 || score.abs() > 9999 {
+                continue;
+            }
+
+            // Convert score and result into the White frame.
+            let white_score = if white_to_move { score } else { -score };
+            let stm_wr = result as f64 / 2.0; // 0=loss, 0.5=draw, 1=win (STM)
+            let white_wr = if white_to_move { stm_wr } else { 1.0 - stm_wr };
+
+            let bin = white_score.clamp(-CLAMP_INT, CLAMP_INT).div_euclid(BIN_INT);
+            let e = bins.entry(bin).or_insert((0, 0.0, 0.0));
+            e.0 += 1;
+            e.1 += white_wr;
+            e.2 += white_score as f64;
+            total += 1;
+            white_sum += white_wr;
+        }
+    }
+
+    if total == 0 {
+        return Ok("calibrate: no valid positions".to_string());
+    }
+
+    let sigmoid = |x: f64| 1.0 / (1.0 + (-x).exp());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "calibrate: {path}\n{total} positions (White frame){}\n\n",
+        if truncated { "  (WARNING: file truncated at tail)" } else { "" }
+    ));
+    out.push_str("  net eval (cp)     positions     White%    implied%\n");
+
+    // For the crossover, walk bins in ascending eval and find where actual White% crosses 0.5,
+    // interpolating between adjacent bin centres (in displayed cp).
+    let mut prev: Option<(f64, f64)> = None; // (bin_centre_cp, white_frac)
+    let mut crossover: Option<f64> = None;
+    for (&bin, &(count, wr_sum, score_sum)) in &bins {
+        let frac = wr_sum / count as f64;
+        let mean_internal = score_sum / count as f64;
+        let implied = sigmoid(mean_internal / EVAL_SCALE);
+        let centre_cp = mean_internal / 4.0;
+        let lo = bin * BIN_CP;
+        let label = if bin <= -CLAMP_CP / BIN_CP {
+            format!("<= {:>4}", -CLAMP_CP)
+        } else if bin >= CLAMP_CP / BIN_CP {
+            format!(">= {:>4}", CLAMP_CP)
+        } else {
+            format!("[{:>4},{:>4})", lo, lo + BIN_CP)
+        };
+        out.push_str(&format!(
+            "  {label:<14} {count:>10}     {:>5.1}%    {:>5.1}%\n",
+            100.0 * frac,
+            100.0 * implied
+        ));
+        if crossover.is_none() {
+            if let Some((pc, pf)) = prev {
+                if (pf - 0.5).signum() != (frac - 0.5).signum() && frac != pf {
+                    let t = (0.5 - pf) / (frac - pf);
+                    crossover = Some(pc + t * (centre_cp - pc));
+                }
+            }
+        }
+        prev = Some((centre_cp, frac));
+    }
+
+    out.push_str(&format!("\noverall White score: {:.2}%\n", 100.0 * white_sum / total as f64));
+    match crossover {
+        Some(c) => {
+            out.push_str(&format!("White scores 50% at net eval = {c:+.1} cp\n"));
+            if c.abs() < 5.0 {
+                out.push_str("  → |crossover| < 5 cp: net is essentially calibrated (no White/Black skew).\n");
+            } else if c < 0.0 {
+                out.push_str(&format!(
+                    "  → crossover < 0: net OVER-FAVOURS BLACK by ~{:.0} cp (scores even positions as Black-ahead).\n",
+                    -c
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  → crossover > 0: net over-favours White by ~{c:.0} cp.\n"
+                ));
+            }
+        }
+        None => out.push_str("White never crosses 50% within the measured eval range (widen the data's eval spread).\n"),
+    }
+    out.push_str(
+        "Compare White% vs implied% per row: a consistent gap with a ~0 crossover = a scale (slope) issue, not a skew.\n",
+    );
+
+    Ok(out)
 }
 
 /// Trim a "TAK6" file in place, removing any incomplete/corrupt tail so that it ends exactly on a

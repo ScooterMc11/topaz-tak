@@ -39,6 +39,20 @@ impl HashTable {
         }
     }
 
+    /// Fully zero every entry, including `hash_and_move`. Unlike `clear()` (which only wipes the
+    /// score/depth bytes and leaves the stored hash + hash-move behind), this makes the table
+    /// genuinely empty: no stale entry can match a `get()`, and no stale hash-move can survive to
+    /// influence move ordering. Used to make a search a pure function of its inputs (reproducible
+    /// fixed-depth evaluation), independent of any prior search that shared this table.
+    pub fn clear_full(&self) {
+        for bucket in &self.buckets {
+            for entry in &bucket.entries {
+                entry.hash_and_move.store(0, Ordering::Relaxed);
+                entry.score_flags.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn occupancy(&self) -> usize {
         let mut hits = 0;
         for i in 0..1000 {

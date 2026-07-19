@@ -1,0 +1,8 @@
+{
+  "config": {"depth": 10, "plies": 4, "cp_bound": 25, "rel_bound": 15, "cp_bound_internal": 100, "rel_bound_internal": 60},
+  "mode": "combined",
+  "rulesets": {
+    "black_stack": {"label": "Black Stack", "archetypes": [{"name": "diagonal corners", "dead": false, "opening_cp": -10.8, "abs": 769, "rel": 511, "both": 511}, {"name": "adjacent corners", "dead": false, "opening_cp": -5.5, "abs": 408, "rel": 193, "both": 193}, {"name": "hug", "dead": false, "opening_cp": -15.0, "abs": 207, "rel": 250, "both": 114}, {"name": "gap hug", "dead": false, "opening_cp": -1.8, "abs": 698, "rel": 307, "both": 307}]},
+    "two_komi": {"label": "2-Komi", "archetypes": [{"name": "diagonal corners", "dead": false, "opening_cp": 21.2, "abs": 991, "rel": 363, "both": 216}, {"name": "adjacent corners", "dead": false, "opening_cp": 19.5, "abs": 905, "rel": 369, "both": 217}, {"name": "hug", "dead": true, "opening_cp": 33.2, "abs": 0, "rel": 0, "both": 0}]}
+  }
+}

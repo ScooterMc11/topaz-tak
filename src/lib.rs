@@ -10,7 +10,11 @@ pub mod balance;
 pub mod balance4;
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod balance5;
+#[cfg(feature = "evaluation")]
+pub mod balanced_lines;
 pub mod board;
+#[cfg(feature = "evaluation")]
+pub mod start_eval;
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod datagen;
 #[cfg(all(feature = "evaluation", feature = "random"))]
@@ -55,6 +59,26 @@ pub struct GameInitializer {
     /// (0 = off => always play the best move). Higher => more random among the top moves. Used to
     /// space the bot ladder below the node-cap floor; see `search::select_softmax`.
     pub temperature: f64,
+    /// Engine-weakening eval-gap tolerance in centipawns (0 = off). When > 0, prune every root move
+    /// more than this far below the best, then pick uniformly among the survivors. A harder-edged
+    /// alternative to `temperature`: it bounds the worst-case blunder and never plays a clearly-worse
+    /// move even from a wide pool. Takes precedence over `temperature` when both are set. See
+    /// `search::select_gap`.
+    pub eval_gap: i32,
+    /// Dynamic eval-gap (0 = off). When `eval_gap_std > 0`, the effective gap flexes with the bot's
+    /// eval between these three anchors (min at <= -50cp / losing, std at 0cp / even, max at >= +50cp
+    /// / winning; see `search::dynamic_gap`). Takes precedence over the static `eval_gap`.
+    pub eval_gap_min: i32,
+    pub eval_gap_std: i32,
+    pub eval_gap_max: i32,
+    /// Linear rank bias applied when picking among the eval-gap survivors (0 = uniform; higher tilts
+    /// toward the WORSE eligible moves, worst:best odds = 1 + bias_slope; see `search::select_gap`).
+    pub bias_slope: f64,
+    /// Absolute "always-allow" floor in centipawns: any root move scoring at least this stays eligible
+    /// even if it falls outside the eval-gap band, so a winning-but-not-best move can still be played.
+    /// Only ever widens the pool (effective floor = `min(best - gap, always_allow)`) and never
+    /// overrides the decisive-best or near-loss guards. `i32::MAX` = disabled. See `search::select_gap`.
+    pub always_allow: i32,
 }
 
 #[cfg(feature = "evaluation")]
@@ -71,6 +95,12 @@ impl GameInitializer {
             hyper: SearchHyper::default(),
             early_abort_depth: 6,
             temperature: 0.0,
+            eval_gap: 0,
+            eval_gap_min: 0,
+            eval_gap_std: 0,
+            eval_gap_max: 0,
+            bias_slope: 0.0,
+            always_allow: i32::MAX,
         }
     }
     pub fn get_board<E: eval::Evaluator + Default>(&self) -> (E::Game, E) {
@@ -115,6 +145,12 @@ impl std::default::Default for GameInitializer {
             hyper: SearchHyper::default(),
             early_abort_depth: 6,
             temperature: 0.0,
+            eval_gap: 0,
+            eval_gap_min: 0,
+            eval_gap_std: 0,
+            eval_gap_max: 0,
+            bias_slope: 0.0,
+            always_allow: i32::MAX,
         }
     }
 }
@@ -356,6 +392,10 @@ pub enum TeiCommand {
     Go(TeiGo),
     Position(String),
     NewGame(usize),
+    /// New half-komi for the running game worker. Sent by the TEI loop when `setoption HalfKomi`
+    /// is processed, so a worker (spawned once per connection) picks up a komi change when the GUI
+    /// switches games without reconnecting. Carries the half-komi value.
+    SetKomi(u8),
 }
 
 pub fn execute_moves_check_valid(board: &mut Board6, ptn_slice: &[&str]) -> Result<Vec<GameMove>> {
