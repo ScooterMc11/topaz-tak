@@ -1,0 +1,7 @@
+{
+  "config": {"depth": 4, "plies": 4, "cp_bound": 30, "cp_bound_internal": 120},
+  "rulesets": {
+    "black_stack": {"label": "Black Stack", "total": 2806, "archetypes": [{"name": "diagonal corners", "count": 794}, {"name": "adjacent corners", "count": 701}, {"name": "hug", "count": 358}, {"name": "gap hug", "count": 953}]},
+    "two_komi": {"label": "2-Komi", "total": 4315, "archetypes": [{"name": "diagonal corners", "count": 1468}, {"name": "adjacent corners", "count": 1577}, {"name": "hug", "count": 1270}]}
+  }
+}

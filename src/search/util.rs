@@ -8,6 +8,20 @@ use crate::{TeiCommand, TimeBank};
 use crossbeam_channel::Receiver;
 use instant::Instant;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Live progress sink a caller can poll from another thread while a long single-threaded search
+/// runs. `depth`/`score` are updated once each iteration completes (deepest completed depth and its
+/// PV score, root side-to-move internal-cp frame); `nodes` is refreshed periodically from
+/// `check_stop`, so it advances even during a single very deep iteration and serves as the liveness
+/// signal. All fields start at 0. Used by the `start_eval` experiment to drive a live monitor.
+#[derive(Default)]
+pub struct SearchProgress {
+    pub depth: AtomicUsize,
+    pub score: AtomicI32,
+    pub nodes: AtomicU64,
+}
 
 #[derive(Clone)]
 pub struct SearchInfo<'a> {
@@ -39,6 +53,14 @@ pub struct SearchInfo<'a> {
     /// `multi_pv` entries). Lets a caller weaken the engine by sampling among the top moves instead
     /// of always taking the best (see `select_softmax`). Empty until the first depth completes.
     pub(crate) root_choices: Vec<(GameMove, i32)>,
+    /// Per-depth `(depth, best_score)` for the principal variation, appended once each iteration
+    /// completes fully (an aborted final depth is not recorded). Lets a caller read the whole
+    /// eval-vs-depth curve from a single iterative-deepening search (see `start_eval`). Empty until
+    /// the first depth completes; scores are in the root side-to-move's internal-cp frame.
+    pub(crate) depth_scores: Vec<(usize, i32)>,
+    /// Optional cross-thread progress sink for a long-running search (see `SearchProgress`). `None`
+    /// for normal searches; set via `report_progress`.
+    pub(crate) progress: Option<Arc<SearchProgress>>,
 }
 
 impl<'a> SearchInfo<'a> {
@@ -70,14 +92,28 @@ impl<'a> SearchInfo<'a> {
             multi_pv: 1,
             forbidden_root_moves: SimpleMoveList::new(),
             root_choices: Vec::new(),
+            depth_scores: Vec::new(),
+            progress: None,
         }
+    }
+    /// Attach a cross-thread progress sink so an external monitor can poll depth/score/nodes while
+    /// this search runs (see `SearchProgress`). Intended for long single-threaded analysis searches.
+    pub fn report_progress(mut self, progress: Arc<SearchProgress>) -> Self {
+        self.progress = Some(progress);
+        self
     }
     /// The deepest completed iteration's root moves with scores, best first (see field docs).
     pub fn root_choices(&self) -> &[(GameMove, i32)] {
         &self.root_choices
     }
+    /// Per-depth `(depth, best_score)` for every fully-completed iteration (see field docs).
+    pub fn depth_scores(&self) -> &[(usize, i32)] {
+        &self.depth_scores
+    }
     pub fn set_multi_pv(mut self, num_pvs: usize) -> Self {
-        self.multi_pv = std::cmp::max(1, num_pvs);
+        // Clamp to [1, MAX_MULTI_PV]: the search's per-PV working arrays are fixed at MAX_MULTI_PV,
+        // so a larger value would index out of bounds.
+        self.multi_pv = num_pvs.clamp(1, crate::search::MAX_MULTI_PV);
         self
     }
     pub fn secondary(mut self) -> Self {
@@ -125,11 +161,17 @@ impl<'a> SearchInfo<'a> {
         self.corr_hist = CorrHist::new();
         self.capture_hist.clear();
         self.pv_table.clear();
+        self.depth_scores.clear();
     }
     pub fn take_input_stream(&mut self) -> Option<Receiver<TeiCommand>> {
         self.input.take()
     }
     pub fn check_stop(&mut self) {
+        // Refresh the liveness counter for any external monitor (throttled: check_stop is called
+        // periodically, not per node). Cheap relaxed store; no-op when no sink is attached.
+        if let Some(ref p) = self.progress {
+            p.nodes.store(self.stats.nodes as u64, Ordering::Relaxed);
+        }
         if self.nodes() as u64 > self.hard_max_nodes {
             self.stopped = true;
             return;
@@ -183,6 +225,12 @@ impl<'a> SearchInfo<'a> {
     }
     pub fn clear_tt(&mut self) {
         self.trans_table.clear();
+    }
+    /// Fully empty the transposition table (see `HashTable::clear_full`). Call before a search that
+    /// must be a pure function of its inputs, so no prior search sharing this table can change the
+    /// result.
+    pub fn clear_tt_full(&self) {
+        self.trans_table.clear_full();
     }
     pub fn quiet(mut self, val: bool) -> Self {
         self.quiet = val;

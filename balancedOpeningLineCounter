@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# balancedOpeningLineCounter -- count "balanced" opening lines for black-stack Tak vs 2-komi Tak
+# (both 6x6) and render the comparison as a PNG.
+#
+# For each ruleset and opening archetype it fixes a canonical opening, then enumerates every
+# continuation `plies` deep over all placement moves, evaluating each position at fixed `depth`.
+# It keeps a line if every position stays inside a band. Two bands are available (pass either or both):
+#   * absolute  (-b / --cpBounds):     every position within +-cpBounds cp of 0.
+#   * relative  (-r / --relativeBounds): every position within +-relativeBounds cp of an anchor -- the
+#                                        archetype's own opening eval by default, or the per-ply top
+#                                        move if --relativeToTop is set.
+# When both bands are given, the PNG shows absolute, relative, and the intersection ("both") per
+# archetype (table layout). --requireBoth counts only the intersection (bar layout) and prunes harder.
+# Output: one PNG in balancedOpeningLineCounterResults/.
+#
+# Usage:
+#   ./balancedOpeningLineCounter -d <depth> -p <plies> -b <cpBounds>
+#   ./balancedOpeningLineCounter -d <depth> -p <plies> -b <cpBounds> -r <relativeBounds> [-rtt] [-rb]
+#   ./balancedOpeningLineCounter -d <depth> -p <plies> -r <relativeBounds> [-rtt]
+#
+#   -d,   --depth            Fixed search depth used to evaluate each position (integer >= 1).
+#   -p,   --plies            Plies per line, INCLUDING the 2 forced opening plies (integer >= 2).
+#   -b,   --cpBounds         Absolute balance bound in human cp (integer >= 0). Optional.
+#   -r,   --relativeBounds   Relative balance bound in human cp (integer >= 0). Optional.
+#   -rtt, --relativeToTop    Anchor the relative band to the per-ply top move (needs -r). Flag.
+#   -rb,  --requireBoth      Count only lines both absolutely and relatively balanced (needs -b and -r). Flag.
+#   At least one of -b / -r is required.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+RESULTS_DIR="balancedOpeningLineCounterResults"
+RENDERER="render_balanced_lines.py"
+
+usage() {
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+DEPTH=""
+PLIES=""
+BOUND=""
+RELBOUND=""
+RTT=0
+RB=0
+
+# --- parse args (supports short/long, and --name=value) ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--depth)             DEPTH="${2:-}"; shift 2 ;;
+        --depth=*)              DEPTH="${1#*=}"; shift ;;
+        -p|--plies)             PLIES="${2:-}"; shift 2 ;;
+        --plies=*)              PLIES="${1#*=}"; shift ;;
+        -b|--cpBounds)          BOUND="${2:-}"; shift 2 ;;
+        --cpBounds=*)           BOUND="${1#*=}"; shift ;;
+        -r|--relativeBounds)    RELBOUND="${2:-}"; shift 2 ;;
+        --relativeBounds=*)     RELBOUND="${1#*=}"; shift ;;
+        -rtt|--relativeToTop)   RTT=1; shift ;;
+        -rb|--requireBoth)      RB=1; shift ;;
+        -h|--help)              usage 0 ;;
+        *) echo "error: unknown argument '$1'" >&2; usage 1 ;;
+    esac
+done
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+fail() { echo "error: $1" >&2; exit 1; }
+
+[[ -n "$DEPTH" ]] || fail "missing required -d/--depth"
+[[ -n "$PLIES" ]] || fail "missing required -p/--plies"
+[[ -n "$BOUND" || -n "$RELBOUND" ]] || fail "provide at least one of -b/--cpBounds or -r/--relativeBounds"
+is_int "$DEPTH" || fail "--depth must be a non-negative integer, got '$DEPTH'"
+is_int "$PLIES" || fail "--plies must be a non-negative integer, got '$PLIES'"
+[[ -z "$BOUND" ]] || is_int "$BOUND" || fail "--cpBounds must be a non-negative integer, got '$BOUND'"
+[[ -z "$RELBOUND" ]] || is_int "$RELBOUND" || fail "--relativeBounds must be a non-negative integer, got '$RELBOUND'"
+(( DEPTH >= 1 )) || fail "--depth must be >= 1"
+(( PLIES >= 2 )) || fail "--plies must be >= 2 (it includes the 2 opening plies)"
+(( RTT == 0 )) || [[ -n "$RELBOUND" ]] || fail "-rtt/--relativeToTop requires -r/--relativeBounds"
+(( RB == 0 )) || { [[ -n "$BOUND" && -n "$RELBOUND" ]] || fail "-rb/--requireBoth requires both -b and -r"; }
+
+# --- pick a python ---
+PY=""
+for cand in python python3 py; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+[[ -n "$PY" ]] || fail "no python interpreter found (need python with Pillow installed)"
+
+mkdir -p "$RESULTS_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+NAME="balanced_d${DEPTH}_p${PLIES}"
+[[ -n "$BOUND" ]] && NAME="${NAME}_b${BOUND}"
+[[ -n "$RELBOUND" ]] && NAME="${NAME}_r${RELBOUND}"
+(( RTT == 1 )) && NAME="${NAME}_rtt"
+(( RB == 1 )) && NAME="${NAME}_rb"
+BASE="${NAME}_${STAMP}"
+JSON="${RESULTS_DIR}/${BASE}.json"
+PNG="${RESULTS_DIR}/${BASE}.png"
+
+TOPAZ="./target/release/topaz.exe"
+[[ -x "$TOPAZ" || -f "$TOPAZ" ]] || TOPAZ="./target/release/topaz"
+
+# --- assemble engine args ---
+ENGINE_ARGS=(-d "$DEPTH" -p "$PLIES")
+[[ -n "$BOUND" ]] && ENGINE_ARGS+=(-b "$BOUND")
+[[ -n "$RELBOUND" ]] && ENGINE_ARGS+=(-r "$RELBOUND")
+(( RTT == 1 )) && ENGINE_ARGS+=(--rtt)
+(( RB == 1 )) && ENGINE_ARGS+=(--rb)
+ENGINE_ARGS+=(-o "$JSON")
+
+DESC="depth=${DEPTH} plies=${PLIES}"
+[[ -n "$BOUND" ]] && DESC="${DESC} cpBounds=+-${BOUND}"
+[[ -n "$RELBOUND" ]] && DESC="${DESC} relativeBounds=+-${RELBOUND}"
+(( RTT == 1 )) && DESC="${DESC} relativeToTop"
+(( RB == 1 )) && DESC="${DESC} requireBoth"
+
+echo "==> Building topaz (release)..."
+cargo build --release --bin topaz
+
+echo "==> Running experiment: ${DESC}"
+echo "    Progress streams below; this can take a while for large depth/plies or loose bounds."
+echo
+"$TOPAZ" balancedlines "${ENGINE_ARGS[@]}"
+
+echo
+echo "==> Rendering PNG..."
+"$PY" "$RENDERER" "$JSON" "$PNG"
+
+echo
+echo "Done."
+echo "  results JSON : $JSON"
+echo "  results PNG  : $PNG"

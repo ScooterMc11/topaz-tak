@@ -171,6 +171,100 @@ pub fn main() {
                 write!(&mut out, "{}", std::str::from_utf8(&variation_buf).unwrap()).unwrap();
             }
             return;
+        } else if arg1 == "gapcompare" {
+            // One-off analysis: for a 6x6 TPS, print the MultiPV root move list + eval-gap
+            // selection %s under a node cap vs a fixed depth, so the two strength modes can be
+            // compared directly. Uses NoviceBot's gap (60/80/100), slope 8, pool 16.
+            // Usage: gapcompare <depth> <tps...>   (depth defaults to 5 if omitted/unparsable).
+            let depth: usize = args.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(5);
+            match build_tps(&args[3..]) {
+                Ok(TakGame::Standard6(board)) => {
+                    let board = board.with_komi(0);
+                    // abort_depth 1 matches the ladder (run-gembot AbortDepth=1). Node mode uses the
+                    // MAX_DEPTH ceiling (32); depth mode uses the target depth as the ceiling.
+                    gap_report(&board, "500k NODES", Some(500_000), 32, 1, 60, 80, 100, 8.0, 16);
+                    gap_report(&board, &format!("DEPTH {}", depth), None, depth, 1, 60, 80, 100, 8.0, 16);
+                }
+                Ok(_) => println!("gapcompare currently supports 6x6 positions only"),
+                Err(e) => println!("bad tps: {}", e),
+            }
+            return;
+        } else if arg1 == "balancedlines" {
+            let mut opts = Options::new();
+            opts.optopt("d", "depth", "Fixed search depth per position (default 9)", "N");
+            opts.optopt("p", "plies", "Plies per line, incl. the 2 opening plies (default 7)", "N");
+            opts.optopt("b", "bound", "Absolute cp balance bound; internal band = 4x (optional)", "N");
+            opts.optopt("r", "relbound", "Relative cp bound around the anchor; 4x (optional)", "N");
+            opts.optflag("", "rtt", "relativeToTop: anchor the relative band to the per-ply top move");
+            opts.optflag("", "rb", "requireBoth: count only lines both absolutely and relatively balanced");
+            opts.optopt("t", "threads", "Worker threads (default: auto-detect)", "N");
+            opts.optopt("o", "output", "JSON results path (default balanced_lines.json)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz balancedlines [options]"));
+                return;
+            }
+            let parse_bound = |flag: &str| -> Option<i32> {
+                matches
+                    .opt_str(flag)
+                    .map(|s| s.trim().parse().unwrap_or_else(|_| panic!("--{flag} must be an integer")))
+            };
+            let cp_bound = parse_bound("b");
+            let rel_bound = parse_bound("r");
+            if cp_bound.is_none() && rel_bound.is_none() {
+                panic!("provide at least one of -b/--bound or -r/--relbound");
+            }
+            let relative_to_top = matches.opt_present("rtt");
+            let require_both = matches.opt_present("rb");
+            if relative_to_top && rel_bound.is_none() {
+                panic!("--rtt (relativeToTop) requires a relative bound (-r)");
+            }
+            if require_both && (cp_bound.is_none() || rel_bound.is_none()) {
+                panic!("--rb (requireBoth) requires both -b and -r");
+            }
+            let default = topaz_tak::balanced_lines::BalancedLinesConfig::default();
+            let cfg = topaz_tak::balanced_lines::BalancedLinesConfig {
+                depth: matches.opt_get_default("d", default.depth).unwrap(),
+                plies: matches.opt_get_default("p", default.plies).unwrap(),
+                cp_bound,
+                rel_bound,
+                relative_to_top,
+                require_both,
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::balanced_lines::run(cfg).expect("balancedlines failed");
+            return;
+        } else if arg1 == "starteval" {
+            let mut opts = Options::new();
+            opts.optopt("d", "maxDepth", "Maximum (ceiling) search depth (default 30)", "N");
+            opts.optopt("t", "threads", "Worker threads (default: auto, capped at #positions)", "N");
+            opts.optopt("o", "output", "JSON results path (default start_eval.json)", "PATH");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz starteval [options]"));
+                return;
+            }
+            let default = topaz_tak::start_eval::StartEvalConfig::default();
+            let cfg = topaz_tak::start_eval::StartEvalConfig {
+                max_depth: matches.opt_get_default("d", default.max_depth).unwrap(),
+                threads: matches.opt_get_default("t", default.threads).unwrap(),
+                output: matches.opt_str("o").unwrap_or(default.output),
+            };
+            topaz_tak::start_eval::run(cfg).expect("starteval failed");
+            return;
         } else if arg1 == "count" {
             let mut eval = NNUE6::default();
             let total: usize = SAVED_TPS
@@ -348,7 +442,18 @@ pub fn main() {
             opts.optopt("g", "games", "Number of self-play games (default 1000)", "N");
             opts.optopt("t", "threads", "Worker threads (default 4)", "N");
             opts.optopt("n", "nodes", "Search node cap per move (default 5000)", "N");
-            opts.optopt("r", "random", "Random opening plies (default 6)", "N");
+            opts.optopt("r", "random", "Random flat opening plies (default 6)", "N");
+            opts.optopt(
+                "b",
+                "book",
+                "TPS opening book; one deterministic game per position (book size = game count, overrides -g/-r/-c)",
+                "PATH",
+            );
+            opts.optflag(
+                "c",
+                "corner",
+                "Pin White's opening double-black-stack to a random corner (ignored with --book)",
+            );
             opts.optopt("o", "output", "Output .bin path (default data.bin)", "PATH");
             opts.optopt("s", "ttsize", "TT entries per thread (default 1048576)", "N");
             opts.optflag("h", "help", "Print this help menu");
@@ -368,6 +473,8 @@ pub fn main() {
                 threads: matches.opt_get_default("t", default.threads).unwrap(),
                 max_nodes: matches.opt_get_default("n", default.max_nodes).unwrap(),
                 random_plies: matches.opt_get_default("r", default.random_plies).unwrap(),
+                corner_open: matches.opt_present("corner"),
+                book_path: matches.opt_str("b"),
                 output: matches.opt_str("o").unwrap_or(default.output),
                 tt_size: matches.opt_get_default("s", default.tt_size).unwrap(),
             };
@@ -383,6 +490,7 @@ pub fn main() {
             opts.optopt("p", "plycap", "Max plies before scoring a draw (default 120)", "N");
             opts.optopt("e", "engine", "Path to tiltak tei binary", "PATH");
             opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optflag("c", "corner", "Pin ply-1 stack to a random corner (ignored with --book)");
             opts.optopt("o", "output", "Output .bin path (default data5.bin)", "PATH");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
@@ -405,6 +513,7 @@ pub fn main() {
                 max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
                 tiltak_path: matches.opt_str("e").unwrap_or(default.tiltak_path),
                 book_path: matches.opt_str("b"),
+                corner_open: matches.opt_present("corner"),
                 output: matches.opt_str("o").unwrap_or(default.output),
             };
             topaz_tak::datagen5::run(cfg).expect("datagen5 failed");
@@ -419,6 +528,7 @@ pub fn main() {
             opts.optopt("p", "plycap", "Max plies before scoring a draw (default 120)", "N");
             opts.optopt("s", "ttsize", "TT entries per thread (default 1048576)", "N");
             opts.optopt("b", "book", "Opening-book TPS file (standard play); default: internal black-stack openings", "PATH");
+            opts.optflag("c", "corner", "Pin ply-1 stack to a random corner (ignored with --book)");
             opts.optopt("o", "output", "Output .bin path (default data5_self.bin)", "PATH");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
@@ -441,6 +551,7 @@ pub fn main() {
                 max_plies: matches.opt_get_default("p", default.max_plies).unwrap(),
                 tt_size: matches.opt_get_default("s", default.tt_size).unwrap(),
                 book_path: matches.opt_str("b"),
+                corner_open: matches.opt_present("corner"),
                 output: matches.opt_str("o").unwrap_or(default.output),
             };
             topaz_tak::datagen5::run_selfplay(cfg).expect("datagen5self failed");
@@ -529,6 +640,13 @@ pub fn main() {
             println!(
                 "{}",
                 topaz_tak::datagen::trim_file(path).expect("could not process data file")
+            );
+            return;
+        } else if arg1 == "calibrate" {
+            let path = args.get(2).expect("usage: topaz calibrate <path.bin>");
+            println!(
+                "{}",
+                topaz_tak::datagen::calibrate_file(path).expect("could not read data file")
             );
             return;
         } else if arg1 == "balance" {
@@ -690,6 +808,11 @@ pub fn main() {
             opts.optopt("t", "tps", "Output TPS book path", "PATH");
             opts.optopt("p", "ptn", "Output PTN book path", "PATH");
             opts.optflag("s", "standard", "Standard-Tak book (single-flat ply 1; diagonal/adjacent/hug archetypes; for the 2-komi comparison)");
+            opts.optflag(
+                "",
+                "no-center-stack",
+                "Exclude the center-stack archetype (4 corner archetypes only; ceiling 348,432)",
+            );
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
                 Ok(m) => m,
@@ -707,6 +830,7 @@ pub fn main() {
                 tps_path: matches.opt_str("t").unwrap_or(d.tps_path),
                 ptn_path: matches.opt_str("p").unwrap_or(d.ptn_path),
                 standard: matches.opt_present("standard"),
+                no_center_stack: matches.opt_present("no-center-stack"),
             };
             topaz_tak::openings::run(cfg).expect("openings failed");
             return;
@@ -716,6 +840,7 @@ pub fn main() {
             opts.optopt("t", "tps", "Output TPS book path", "PATH");
             opts.optopt("p", "ptn", "Output PTN book path", "PATH");
             opts.optflag("s", "standard", "Standard-Tak book (single-flat ply 1; diagonal/adjacent/hug archetypes)");
+            opts.optflag("", "no-center-stack", "Exclude the center-stack archetype (4 corner archetypes only)");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
                 Ok(m) => m,
@@ -733,6 +858,7 @@ pub fn main() {
                 tps_path: matches.opt_str("t").unwrap_or(d.tps_path),
                 ptn_path: matches.opt_str("p").unwrap_or(d.ptn_path),
                 standard: matches.opt_present("standard"),
+                no_center_stack: matches.opt_present("no-center-stack"),
             };
             topaz_tak::openings5::run(cfg).expect("openings5 failed");
             return;
@@ -778,6 +904,120 @@ pub fn main() {
         play_game_cmd(false)
     } else {
         println!("Unknown command: {}", buffer);
+    }
+}
+
+/// Analysis helper for the `gapcompare` subcommand. Replicates the EXACT playtak search config
+/// (12s flat time bank => aborts new depths after ~6s; `abort_depth`; MultiPV `pool`) so the printed
+/// root moves and eval-gap selection %s match what the live bot would do. Node mode passes
+/// `node_cap = Some(n)` with `ceiling = MAX_DEPTH`; fixed-depth mode passes `None` with
+/// `ceiling = depth`.
+fn gap_report(
+    board: &Board6,
+    label: &str,
+    node_cap: Option<u64>,
+    ceiling: usize,
+    abort_depth: usize,
+    gap_min: i32,
+    gap_std: i32,
+    gap_max: i32,
+    slope: f64,
+    pool: usize,
+) {
+    use topaz_tak::eval::{LOSE_SCORE, WIN_SCORE};
+    let table = HashTable::new(2 << 20);
+    let mut b = board.clone();
+    let mut eval = NNUE6::default();
+    // Match the playtak loop's SearchInfo exactly (topaz.rs playtak Go handler).
+    let mut info = SearchInfo::new(ceiling, &table)
+        .quiet(true)
+        .time_bank(TimeBank::flat(12_000))
+        .abort_depth(abort_depth)
+        .set_multi_pv(pool);
+    if let Some(n) = node_cap {
+        info = info.set_max_nodes(n, n);
+    }
+    let start = Instant::now();
+    let outcome = topaz_tak::search::multi_search(&mut b, &mut eval, &mut info, 1);
+    let elapsed_ms = start.elapsed().as_millis();
+    let depth_reached = outcome.as_ref().map(|o| o.depth).unwrap_or(0);
+    let nodes = info.nodes();
+    let choices: Vec<(String, i32)> = info
+        .root_choices()
+        .iter()
+        .map(|(m, s)| (m.to_ptn::<Board6>(), *s))
+        .collect();
+
+    println!("\n================ {} ================", label);
+    println!(
+        "elapsed: {} ms   nodes searched: {}   depth reached: {}   scored root moves: {}",
+        elapsed_ms,
+        nodes,
+        depth_reached,
+        choices.len()
+    );
+    if choices.is_empty() {
+        println!("(search returned no root choices)");
+        return;
+    }
+    let best = choices[0].1;
+    let gap = topaz_tak::search::dynamic_gap(best, gap_min, gap_std, gap_max);
+    let threshold = best - gap;
+    println!(
+        "best score: {} cp   dynamic gap: {} cp (from {}/{}/{})   eligible if score >= {} cp",
+        best, gap, gap_min, gap_std, gap_max, threshold
+    );
+    println!("--- all scored root moves (rank. move  score) ---");
+    for (i, (m, s)) in choices.iter().enumerate() {
+        println!("  {:>2}. {:<9} {:>6} cp", i + 1, m, s);
+    }
+
+    let decisive = best > WIN_SCORE - 10 || best < LOSE_SCORE + 10;
+    let survivors: Vec<&(String, i32)> = choices
+        .iter()
+        .filter(|(_, s)| *s >= threshold && *s > LOSE_SCORE + 10)
+        .collect();
+    let n = if decisive || gap <= 0 || choices.len() < 2 || survivors.len() < 2 {
+        1
+    } else {
+        survivors.len()
+    };
+    println!("--- eligible moves & selection % (bias slope {}) ---", slope);
+    if n < 2 {
+        println!("  {:<9} 100.00%   (only the best move is eligible)", choices[0].0);
+    } else {
+        let denom = (n - 1) as f64;
+        let weights: Vec<f64> = (0..n)
+            .map(|i| (1.0 + slope * (i as f64 / denom)).max(0.0))
+            .collect();
+        let total: f64 = weights.iter().sum();
+        for i in 0..n {
+            let (m, s) = survivors[i];
+            println!("  {:<9} {:>6} cp   {:>6.2}%", m, s, 100.0 * weights[i] / total);
+        }
+    }
+
+    // Authoritative cross-check: sample the bot's OWN select_gap_dynamic over evenly spaced u in
+    // [0,1). Inverse-CDF sampling makes these proportions exact, and it is the live selection code
+    // (not a reimplementation) applied to the exact root_choices the search produced.
+    let raw = info.root_choices().to_vec();
+    let samples = 200_000usize;
+    let mut tally: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for i in 0..samples {
+        let u = (i as f64 + 0.5) / samples as f64;
+        // This diagnostic exercises the base dynamic-gap behavior only (always-allow disabled).
+        if let Some(m) =
+            topaz_tak::search::select_gap_dynamic(&raw, gap_min, gap_std, gap_max, slope, i32::MAX, u)
+        {
+            *tally.entry(m.to_ptn::<Board6>()).or_insert(0) += 1;
+        }
+    }
+    let mut rows: Vec<(String, usize)> = tally.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("--- selection % from the bot's OWN select_gap_dynamic ({} samples) ---", samples);
+    for (m, c) in rows {
+        let sc = choices.iter().find(|(mm, _)| *mm == m).map(|(_, s)| *s).unwrap_or(0);
+        println!("  {:<9} {:>6} cp   {:>6.2}%", m, sc, 100.0 * c as f64 / samples as f64);
     }
 }
 
@@ -986,7 +1226,7 @@ impl TimeLeft {
 
 fn play_game_tei<E: Evaluator + Default + Send>(
     receiver: Receiver<TeiCommand>,
-    init: GameInitializer,
+    mut init: GameInitializer,
 ) -> Result<()> {
     let (mut board, mut eval) = init.get_board::<E>();
     let table = HashTable::new(init.hash_size);
@@ -1007,10 +1247,11 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                 if init.max_nodes > 0 {
                     info = info.set_max_nodes(init.max_nodes as u64, init.max_nodes as u64);
                 }
-                // Weakening needs a pool to sample from: widen MultiPV to at least 5 (cap 8) when a
-                // temperature is set, even if the caller left MultiPV at 1.
-                let pv_width = if init.temperature > 0.0 {
-                    init.multi_pv.max(5).min(8)
+                // Weakening needs a pool to sample from: widen MultiPV to at least 5 (cap 16) when any
+                // weakening knob (temperature / static or dynamic eval-gap) is set.
+                let pv_width = if init.temperature > 0.0 || init.eval_gap > 0 || init.eval_gap_std > 0
+                {
+                    init.multi_pv.max(5).min(16)
                 } else {
                     init.multi_pv
                 };
@@ -1054,8 +1295,33 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                 if let Some(outcome) = res {
                     println!("{}", outcome);
                     let best = outcome.best_move().expect("Could not find best move!");
-                    // Weakening knob: sample among the top root moves when a temperature is set.
-                    let chosen = if init.temperature > 0.0 {
+                    // Weakening knobs in precedence order: dynamic eval-gap -> static eval-gap ->
+                    // temperature; none set => the best move.
+                    let chosen = if init.eval_gap_std > 0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_gap_dynamic(
+                            info.root_choices(),
+                            init.eval_gap_min,
+                            init.eval_gap_std,
+                            init.eval_gap_max,
+                            init.bias_slope,
+                            init.always_allow,
+                            u,
+                        )
+                        .map(|m| m.to_ptn::<E::Game>())
+                        .unwrap_or(best)
+                    } else if init.eval_gap > 0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_gap(
+                            info.root_choices(),
+                            init.eval_gap,
+                            init.bias_slope,
+                            init.always_allow,
+                            u,
+                        )
+                        .map(|m| m.to_ptn::<E::Game>())
+                        .unwrap_or(best)
+                    } else if init.temperature > 0.0 {
                         let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
                         topaz_tak::search::select_softmax(info.root_choices(), init.temperature, u)
                             .map(|m| m.to_ptn::<E::Game>())
@@ -1083,6 +1349,12 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                         position_hashes.push(board.hash());
                     }
                 }
+            }
+            TeiCommand::SetKomi(k) => {
+                // Applied to init; the next Position rebuilds the board with this komi, so the
+                // subsequent search selects the matching net and opening rule.
+                init.komi = k;
+                println!("info string set komi to {}", k);
             }
             TeiCommand::NewGame(_size) => {
                 info.clear_tt();
@@ -1114,8 +1386,13 @@ fn identify() {
     println!("option name Hash type spin default 8 min 1 max 1024");
     println!("option name MaxNodes type spin default -1 min -1 max 10000000");
     println!("option name AbortDepth type spin default 6 min 1 max 64");
-    println!("option name MultiPV type spin default 1 min 1 max 8");
+    println!("option name MultiPV type spin default 1 min 1 max 16");
     println!("option name Temperature type string default 0");
+    println!("option name EvalGap type spin default 0 min 0 max 100000");
+    println!("option name EvalGapMin type spin default 0 min 0 max 100000");
+    println!("option name EvalGapStd type spin default 0 min 0 max 100000");
+    println!("option name EvalGapMax type spin default 0 min 0 max 100000");
+    println!("option name BiasSlope type string default 0");
     if TUNING {
         println!("option name RFP type spin default 115 min 50 max 150");
         println!("option name FP type spin default 50 min 30 max 100");
@@ -1177,6 +1454,9 @@ fn tei_loop() {
             if name == "HalfKomi" {
                 init.komi = value.parse().unwrap();
                 println!("Setting komi to {}", init.komi);
+                // Forward to the already-spawned worker so an in-UI game switch (no reconnect)
+                // updates komi -> net + opening rule, instead of reusing the previous game's.
+                sender.send(TeiCommand::SetKomi(init.komi)).ok();
             } else if name == "Threads" {
                 init.num_threads = value.parse().unwrap();
                 println!("Setting threads to {}", init.num_threads);
@@ -1195,6 +1475,24 @@ fn tei_loop() {
             } else if name == "Temperature" {
                 init.temperature = value.parse().unwrap();
                 println!("Setting Temperature to {}", init.temperature);
+            } else if name == "EvalGap" {
+                init.eval_gap = value.parse().unwrap();
+                println!("Setting EvalGap to {}", init.eval_gap);
+            } else if name == "EvalGapMin" {
+                init.eval_gap_min = value.parse().unwrap();
+                println!("Setting EvalGapMin to {}", init.eval_gap_min);
+            } else if name == "EvalGapStd" {
+                init.eval_gap_std = value.parse().unwrap();
+                println!("Setting EvalGapStd to {}", init.eval_gap_std);
+            } else if name == "EvalGapMax" {
+                init.eval_gap_max = value.parse().unwrap();
+                println!("Setting EvalGapMax to {}", init.eval_gap_max);
+            } else if name == "BiasSlope" {
+                init.bias_slope = value.parse().unwrap();
+                println!("Setting BiasSlope to {}", init.bias_slope);
+            } else if name == "AlwaysAllow" {
+                init.always_allow = value.parse().unwrap();
+                println!("Setting AlwaysAllow to {}", init.always_allow);
             } else if name == "RFP" {
                 init.hyper.rfp_margin = value.parse().unwrap();
             } else if name == "FP" {
@@ -1242,8 +1540,11 @@ struct PlaytakConfig {
     color: String,
     unrated: u8,
     komi: u8,
-    /// Node cap per move (the strength knob; see §4.5/§8). 0 disables the cap.
+    /// Node cap per move (a strength knob; see §4.5/§8). 0 disables the cap. Ignored when `depth > 0`.
     nodes: u64,
+    /// Fixed search depth (iterative-deepening ceiling). When > 0 the search runs to exactly this
+    /// depth and the node cap is ignored; the flat time bank still prevents flagging. 0 = use `nodes`.
+    depth: usize,
     /// Iterative-deepening depth below which the node/time cap is not honored. Low (e.g. 1-2) lets
     /// small `nodes` caps actually bite; the engine default 6 imposes a ~4k-node floor.
     abort_depth: usize,
@@ -1256,6 +1557,24 @@ struct PlaytakConfig {
     temperature: f64,
     /// How many top root moves to sample among when `temperature > 0` (MultiPV width, capped at 8).
     move_pool: usize,
+    /// Engine-weakening eval-gap tolerance in centipawns (0 = off). When > 0, prune root moves more
+    /// than this far below the best and pick uniformly among survivors (`search::select_gap`). Takes
+    /// precedence over `temperature`. Also widens MultiPV to `move_pool` so there's a pool to prune.
+    eval_gap: i32,
+    /// Dynamic eval-gap anchors (cp). When `eval_gap_std > 0`, the gap flexes with the bot's eval:
+    /// min at <= -50cp (losing => strongest), std at 0cp (even), max at >= +50cp (winning => weakest);
+    /// see `search::dynamic_gap`. Takes precedence over the static `eval_gap`.
+    eval_gap_min: i32,
+    eval_gap_std: i32,
+    eval_gap_max: i32,
+    /// Linear rank bias for picking among the eval-gap survivors (0 = uniform; higher tilts toward
+    /// the WORSE eligible moves, worst:best odds = 1 + bias_slope). Decimal-valued. See select_gap.
+    bias_slope: f64,
+    /// Absolute "always-allow" floor (cp): any root move scoring at least this stays eligible even if
+    /// it falls outside the eval-gap band (so a winning-but-not-best move can be played). Only widens
+    /// the pool; never overrides the decisive-best/near-loss guards. `i32::MAX` = disabled. See
+    /// `search::select_gap`.
+    always_allow: i32,
 }
 
 impl PlaytakConfig {
@@ -1303,6 +1622,9 @@ impl PlaytakConfig {
             nodes: get("PLAYTAK_NODES")
                 .and_then(|x| x.trim().parse().ok())
                 .unwrap_or(10_000),
+            depth: get("PLAYTAK_DEPTH")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
             abort_depth: get("PLAYTAK_ABORT_DEPTH")
                 .and_then(|x| x.trim().parse().ok())
                 .unwrap_or(2),
@@ -1316,15 +1638,33 @@ impl PlaytakConfig {
                         .collect::<Vec<_>>()
                 })
                 .filter(|v| v.len() == 4)
-                .unwrap_or_else(|| vec![20.0, 25.0, 30.0, 25.0]),
+                .unwrap_or_else(|| vec![25.0, 25.0, 25.0, 25.0]),
             temperature: get("PLAYTAK_TEMPERATURE")
                 .and_then(|x| x.trim().parse().ok())
                 .unwrap_or(0.0),
-            // MultiPV width is capped at 8 by the search's fixed-size per-PV arrays.
+            // MultiPV width is capped at MAX_MULTI_PV (16) by the search's fixed-size per-PV arrays.
             move_pool: get("PLAYTAK_MOVE_POOL")
                 .and_then(|x| x.trim().parse().ok())
                 .unwrap_or(5)
-                .clamp(1, 8),
+                .clamp(1, 16),
+            eval_gap: get("PLAYTAK_EVAL_GAP")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
+            eval_gap_min: get("PLAYTAK_EVAL_GAP_MIN")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
+            eval_gap_std: get("PLAYTAK_EVAL_GAP_STD")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
+            eval_gap_max: get("PLAYTAK_EVAL_GAP_MAX")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
+            bias_slope: get("PLAYTAK_BIAS_SLOPE")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0.0),
+            always_allow: get("PLAYTAK_ALWAYS_ALLOW")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(i32::MAX),
         }
     }
 
@@ -1390,32 +1730,175 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                         continue 'outer;
                     }
                 }
+                // White's opening: GUARANTEE the double black stack lands on a corner. The node-capped
+                // search would occasionally pick a non-corner square; force a uniform-random corner
+                // instead (sent as the "2<sq>" forced double placement, same PTN the engine/server use).
+                // NB: move_num starts at 1 (board.rs), so White's opening is move_num()==1, NOT 0 -
+                // matches the Position-handler DBS reconstruction below. (The ==0 typo never fired.)
+                if board.side_to_move() == Color::White && board.move_num() == 1 {
+                    let last = (b'a' + size as u8 - 1) as char;
+                    let corners = [
+                        "a1".to_string(),
+                        format!("a{}", size),
+                        format!("{}1", last),
+                        format!("{}{}", last, size),
+                    ];
+                    let idx = (rand_core::RngCore::next_u32(&mut rng) as usize) % corners.len();
+                    let mv = format!("2{}", corners[idx]);
+                    println!("White opening: forcing double black stack to corner {}", corners[idx]);
+                    server_send.send(mv).unwrap();
+                    continue 'outer;
+                }
                 // Node-capped search (the strength knob). The flat time bank is a safety net so the
                 // bot never flags; with a low node cap moves finish well within it. Tracking the
                 // server clock for a tighter bank is a future refinement (§4.5).
-                let mut info = SearchInfo::new(MAX_DEPTH, &table)
+                // Strength knob: fixed depth (config.depth > 0) OR node cap (fallback). Fixed depth
+                // searches to exactly config.depth regardless of board complexity; the flat time bank
+                // still bounds wall-clock so a hairy position degrades to the best move found so far
+                // instead of flagging, rather than searching unboundedly.
+                let ceiling = if config.depth > 0 { config.depth } else { MAX_DEPTH };
+                let mut info = SearchInfo::new(ceiling, &table)
                     .time_bank(TimeBank::flat(12_000))
-                    .abort_depth(config.abort_depth);
-                if config.nodes > 0 {
+                    .abort_depth(config.abort_depth)
+                    .quiet(true); // suppress per-depth PV spam; we print a clean per-move block below
+                if config.depth == 0 && config.nodes > 0 {
                     info = info.set_max_nodes(config.nodes, config.nodes);
                 }
-                if config.temperature > 0.0 {
+                // All weakening knobs need a pool of scored root moves to choose among.
+                if config.temperature > 0.0 || config.eval_gap > 0 || config.eval_gap_std > 0 {
                     info = info.set_multi_pv(config.move_pool);
                 }
+                let search_start = Instant::now();
                 let res = topaz_tak::search::multi_search(&mut board, &mut eval, &mut info, 1);
                 if let Some(outcome) = res {
-                    // Weakening knob: when a temperature is set, sample among the top root moves
-                    // (info.root_choices) instead of always taking the best. Falls back to best.
-                    let chosen = if config.temperature > 0.0 {
+                    let out_depth = outcome.depth;
+                    let out_score = outcome.score();
+                    // Weakening knobs (all sample from info.root_choices, else take the best), in
+                    // precedence order: dynamic eval-gap -> static eval-gap -> temperature.
+                    let best = || outcome.best_move().expect("could not find best move!");
+                    let chosen = if config.eval_gap_std > 0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_gap_dynamic(
+                            info.root_choices(),
+                            config.eval_gap_min,
+                            config.eval_gap_std,
+                            config.eval_gap_max,
+                            config.bias_slope,
+                            config.always_allow,
+                            u,
+                        )
+                        .map(|m| m.to_ptn::<E::Game>())
+                        .unwrap_or_else(best)
+                    } else if config.eval_gap > 0 {
+                        let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
+                        topaz_tak::search::select_gap(
+                            info.root_choices(),
+                            config.eval_gap,
+                            config.bias_slope,
+                            config.always_allow,
+                            u,
+                        )
+                        .map(|m| m.to_ptn::<E::Game>())
+                        .unwrap_or_else(best)
+                    } else if config.temperature > 0.0 {
                         let u = rand_core::RngCore::next_u32(&mut rng) as f64 / u32::MAX as f64;
                         topaz_tak::search::select_softmax(info.root_choices(), config.temperature, u)
                             .map(|m| m.to_ptn::<E::Game>())
-                            .unwrap_or_else(|| {
-                                outcome.best_move().expect("could not find best move!")
-                            })
+                            .unwrap_or_else(best)
                     } else {
-                        outcome.best_move().expect("could not find best move!")
+                        best()
                     };
+
+                    // ---- Per-move selection log (depth-vs-nodes debugging) ----
+                    // One structured block per move so the exact search + weakening can be audited
+                    // from the bot's live output. `*` marks moves inside the eval-gap (eligible to
+                    // be sampled); the CHOSEN line shows what actually got played and its rank.
+                    {
+                        let elapsed_ms = search_start.elapsed().as_millis();
+                        let choices = info.root_choices();
+                        let mode = if config.depth > 0 {
+                            format!("depth {} (fixed)", config.depth)
+                        } else if config.nodes > 0 {
+                            format!("nodes {} cap", config.nodes)
+                        } else {
+                            "full strength".to_string()
+                        };
+                        let best_score = choices.first().map(|(_, s)| *s).unwrap_or(out_score);
+                        let gap = if config.eval_gap_std > 0 {
+                            topaz_tak::search::dynamic_gap(
+                                best_score,
+                                config.eval_gap_min,
+                                config.eval_gap_std,
+                                config.eval_gap_max,
+                            )
+                        } else {
+                            config.eval_gap
+                        };
+                        // Effective floor folds in the always-allow floor (min => never raises the band).
+                        let threshold = (best_score - gap).min(config.always_allow);
+                        // Displayed cp are in standard centipawns: the engine eval SCALE is 400/pawn,
+                        // so divide raw scores by 4 to match the 0-300 gap scale used in the UI.
+                        let cp = |x: i32| x as f64 / 4.0;
+                        // Per-move selection % (matches search::select_gap sampling). Empty map => the
+                        // best move is played with certainty (weakening off / decisive position).
+                        let prob_map: std::collections::HashMap<usize, f64> =
+                            topaz_tak::search::selection_probabilities(
+                                choices,
+                                gap,
+                                config.bias_slope,
+                                config.always_allow,
+                            )
+                            .into_iter()
+                            .collect();
+                        let weakening_active = !prob_map.is_empty();
+                        let stm = if board.side_to_move() == Color::White { "White" } else { "Black" };
+                        println!("========== MOVE {} ({} to play) ==========", board.move_num(), stm);
+                        println!(
+                            "mode: {} | reached depth {} in {} nodes, {} ms",
+                            mode, out_depth, info.nodes(), elapsed_ms
+                        );
+                        let always_note = if config.always_allow < i32::MAX {
+                            format!(" | always-allow >= {:.1} cp", cp(config.always_allow))
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "best eval: {:.1} cp | gap: {:.1} cp ({:.1}/{:.1}/{:.1}){} | eligible if score >= {:.1} cp",
+                            cp(best_score),
+                            cp(gap),
+                            cp(config.eval_gap_min),
+                            cp(config.eval_gap_std),
+                            cp(config.eval_gap_max),
+                            always_note,
+                            cp(threshold)
+                        );
+                        for (i, (m, s)) in choices.iter().enumerate() {
+                            let mv = m.to_ptn::<E::Game>();
+                            if let Some(p) = prob_map.get(&i) {
+                                // Eligible: '*' + the calculated selection chance.
+                                println!("  {:>2}. {:<9} {:>8.1} cp  * {:>6.2}%", i + 1, mv, cp(*s), 100.0 * p);
+                            } else if !weakening_active && i == 0 {
+                                // Weakening off => the best move is chosen every time.
+                                println!("  {:>2}. {:<9} {:>8.1} cp  * {:>6.2}%", i + 1, mv, cp(*s), 100.0);
+                            } else {
+                                println!("  {:>2}. {:<9} {:>8.1} cp", i + 1, mv, cp(*s));
+                            }
+                        }
+                        let rank = choices.iter().position(|(m, _)| m.to_ptn::<E::Game>() == chosen);
+                        match rank {
+                            Some(idx) => println!(
+                                "CHOSEN: {}  (rank {} of {}, {:.1} cp){}",
+                                chosen,
+                                idx + 1,
+                                choices.len(),
+                                cp(choices[idx].1),
+                                if idx == 0 { "  [best]" } else { "  [weakened]" }
+                            ),
+                            None => println!("CHOSEN: {}", chosen),
+                        }
+                        println!();
+                    }
+
                     server_send.send(chosen).unwrap();
                 } else {
                     println!("Something went wrong, search failed!");
@@ -1502,10 +1985,16 @@ fn playtak_loop(
             let mut goal: Option<String> = None;
             let mut live_seek = false;
             let mut moves: Vec<String> = Vec::new();
+            // Liveness watchdog: seconds since we last received ANY bytes from the server. A server
+            // restart can leave the socket silent without a clean close (read_nonblocking just keeps
+            // returning NoData), so the outer reconnect loop would never fire. We ping every 30s and
+            // the server answers, so >~2 ping cycles of total silence means the connection is dead.
+            let mut silence = 0;
             loop {
                 match com.read_nonblocking() {
                     Ok(event) => match event {
                         Event::Data(buffer) => {
+                            silence = 0;
                             let s = match std::str::from_utf8(&(*buffer)) {
                                 Ok(s) => s,
                                 Err(_) => continue,
@@ -1566,6 +2055,14 @@ fn playtak_loop(
                         Event::NoData => {
                             thread::sleep(std::time::Duration::from_secs(1));
                             counter += 1;
+                            silence += 1;
+                            if silence >= 75 {
+                                println!(
+                                    "No server data for {}s; connection presumed dead, reconnecting",
+                                    silence
+                                );
+                                continue 'reconnect;
+                            }
                             if counter >= 30 {
                                 counter = 0;
                                 println!("Pinging server!");

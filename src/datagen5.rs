@@ -16,7 +16,7 @@ use crate::eval::{build_nn_repr5, BoardData5, NNUE5};
 use crate::generate_all_moves;
 use crate::search::{search, SearchInfo};
 use crate::transposition_table::HashTable;
-use crate::{GameMove, GameResult, Piece, Position};
+use crate::{Color, GameMove, GameResult, Piece, Position};
 
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -56,6 +56,9 @@ pub struct DataGen5Config {
     /// Optional opening book (TPS per line, move_num>=2). If set, games start from book positions
     /// (standard play); if None, openings are generated internally (black-stack).
     pub book_path: Option<String>,
+    /// Pin ply-1's `2xx` stack to a random corner (ignored in book mode). Fixes the off-corner
+    /// stack skew; see `start_board`.
+    pub corner_open: bool,
     /// Output `.bin` path.
     pub output: String,
 }
@@ -67,6 +70,7 @@ impl Default for DataGen5Config {
             threads: 4,
             max_nodes: 10_000,
             random_plies: 6,
+            corner_open: false,
             max_plies: 120,
             half_komi: 0,
             tiltak_path: "../tiltak/target/release/tei.exe".to_string(),
@@ -159,20 +163,35 @@ fn load_book(path: &str) -> io::Result<Vec<String>> {
 /// Build a game's starting board. With a book, start from a random book position (which must be at
 /// `move_num >= 2` so the black-stack rule never fires — i.e. standard play). Without a book, start
 /// from a fresh board and apply `random_plies` random flats (forced `2xx` at ply 1 -> black-stack).
-fn start_board(book: &Option<Arc<Vec<String>>>, random_plies: usize, rng: &mut impl RngCore) -> Board5 {
+/// With `corner_open`, ply 1's `2xx` stack is pinned to a random corner (consuming one of the
+/// `random_plies`) — a uniformly random stack square is off-corner ~88% of the time on 5x5 and
+/// skews the data toward Black, the same distortion fixed on 6x6.
+fn start_board(
+    book: &Option<Arc<Vec<String>>>,
+    random_plies: usize,
+    corner_open: bool,
+    rng: &mut impl RngCore,
+) -> Board5 {
     if let Some(book) = book {
         let line = &book[(rng.next_u32() as usize) % book.len()];
-        Board5::try_from_tps(line).expect("book TPS should parse")
-    } else {
-        let mut board = Board5::new();
-        for _ in 0..random_plies {
-            if board.game_result().is_some() {
-                break;
-            }
-            do_random_flat_move(&mut board, rng);
-        }
-        board
+        return Board5::try_from_tps(line).expect("book TPS should parse");
     }
+    let mut board = Board5::new();
+    let mut plies = random_plies;
+    if corner_open && plies > 0 {
+        const CORNERS: [&str; 4] = ["2a1", "2a5", "2e1", "2e5"];
+        let mv = GameMove::try_from_ptn_m(CORNERS[(rng.next_u32() % 4) as usize], 5, Color::White)
+            .expect("valid corner double-placement");
+        board.do_move(mv);
+        plies -= 1;
+    }
+    for _ in 0..plies {
+        if board.game_result().is_some() {
+            break;
+        }
+        do_random_flat_move(&mut board, rng);
+    }
+    board
 }
 
 /// Play one random flat placement (the forced `2xx` at ply 1 is itself a flat, so it is preserved).
@@ -326,7 +345,7 @@ fn worker(
         positions.clear();
         tiltak.new_game(5)?;
         // Opening: a book position (standard, move_num>=2) or an internally generated black-stack one.
-        let mut board = start_board(&book, cfg.random_plies, &mut rng);
+        let mut board = start_board(&book, cfg.random_plies, cfg.corner_open, &mut rng);
 
         // tiltak plays out standard Tak from the opening TPS; record each position.
         let mut plies = 0;
@@ -486,6 +505,9 @@ pub struct SelfPlay5Config {
     /// Optional opening book (TPS per line, move_num>=2). If set, games start from book positions
     /// (standard play); if None, openings are generated internally (black-stack).
     pub book_path: Option<String>,
+    /// Pin ply-1's `2xx` stack to a random corner (ignored in book mode). Fixes the off-corner
+    /// stack skew; see `start_board`.
+    pub corner_open: bool,
     pub output: String,
     /// Transposition-table entries per worker thread.
     pub tt_size: usize,
@@ -498,6 +520,7 @@ impl Default for SelfPlay5Config {
             threads: 4,
             max_nodes: 5000,
             random_plies: 6,
+            corner_open: false,
             max_plies: 120,
             half_komi: 0,
             book_path: None,
@@ -525,7 +548,7 @@ fn worker_selfplay(
         table.clear();
         positions.clear();
         // Opening: a book position (standard, move_num>=2) or an internally generated black-stack one.
-        let mut board = start_board(&book, cfg.random_plies, &mut rng);
+        let mut board = start_board(&book, cfg.random_plies, cfg.corner_open, &mut rng);
 
         // Self-play to game end, recording each searched position + Topaz's eval.
         let mut plies = 0;

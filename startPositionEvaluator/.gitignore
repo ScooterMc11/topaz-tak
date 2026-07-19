@@ -1,0 +1,2 @@
+# Private isolated cargo build dir (so runs never fight a running bot ladder's binary lock).
+.build/

@@ -11,9 +11,15 @@ use crate::{Bitboard, TeiCommand};
 #[cfg(feature = "cli")]
 pub mod book;
 mod util;
-pub use util::{HashHistory, SearchHyper, SearchInfo, SearchOutcome, SearchStats};
+pub use util::{HashHistory, SearchHyper, SearchInfo, SearchOutcome, SearchProgress, SearchStats};
 
 const DRAW_SCORE: i32 = 0;
+
+/// Maximum MultiPV width, and the size of the per-PV working arrays in `search`. The forbidden-root-
+/// move list (`SimpleMoveList` in move_gen, used as `SearchInfo.forbidden_root_moves`) must have
+/// capacity >= this, otherwise a pool wider than that list would re-find already-used moves
+/// (duplicate entries in `root_choices`). Keep the two in sync.
+pub const MAX_MULTI_PV: usize = 16;
 
 const NULL_REDUCTION_ENABLED: bool = true;
 const NULL_REDUCE_PV: bool = false; // probably shouldn't
@@ -86,9 +92,17 @@ where
     // let mut node_counts = vec![1];
     info.start_search(board.ply());
     eval.set_tempo_offset(info.hyper.tempo_bonus);
-    let mut alphas = [-1_000_000; 8];
-    let mut betas = [1_000_000; 8];
-    let mut solved = [false; 8];
+    // Pick komi-specialized weights once per search (before any eval); helper threads run their own
+    // search() so each configures its own evaluator. No-op for komi-agnostic evaluators.
+    eval.set_komi(board.komi());
+    if info.main_thread && !info.quiet {
+        // TEI-safe diagnostic: shows the half-komi the engine is actually searching with, so a
+        // GUI/komi wiring problem is visible in the engine log.
+        println!("info string half_komi {}", board.komi());
+    }
+    let mut alphas = [-1_000_000; MAX_MULTI_PV];
+    let mut betas = [1_000_000; MAX_MULTI_PV];
+    let mut solved = [false; MAX_MULTI_PV];
     // let mut alpha = -1_000_000;
     // let mut beta = 1_000_000;
     let mut moves: [SmartMoveBuffer; 50] = core::array::from_fn(|_| SmartMoveBuffer::new(0));
@@ -110,8 +124,11 @@ where
         info.forbidden_root_moves.clear();
         depth_choices.clear();
         let num_pvs = info.multi_pv as usize;
-        if solved[num_pvs - 1] {
-            // Stop wasting time
+        if solved[0] {
+            // The best move is a proven win/loss; deeper search can't change the
+            // recommendation. (Must key off the best PV, not the worst-of-top-N: a
+            // losing tail move is normal when a threat is on the board and must not
+            // abort the whole search.)
             break;
         }
         for pv_idx in 0..num_pvs {
@@ -217,6 +234,17 @@ where
         // This depth completed fully: record its top root moves+scores so a caller can sample
         // among them (move-selection weakening) instead of always playing the best move.
         info.root_choices = depth_choices.clone();
+        // Also snapshot the PV score at this completed depth so a caller can read the whole
+        // eval-vs-depth curve from one search (see `start_eval`). Only fully-completed depths land
+        // here: an aborted final iteration breaks out of `'outer` above before reaching this point.
+        if let Some(ref o) = outcome {
+            info.depth_scores.push((o.depth, o.score()));
+            if let Some(p) = &info.progress {
+                use std::sync::atomic::Ordering;
+                p.depth.store(o.depth, Ordering::Relaxed);
+                p.score.store(o.score(), Ordering::Relaxed);
+            }
+        }
     }
     info.hist_moves.clear();
     info.counter_moves.clear();
@@ -265,6 +293,170 @@ pub fn select_softmax(
         }
     }
     Some(best) // floating-point rounding fallthrough
+}
+
+/// Static "eval-gap tolerance" weakening. Keeps only the root moves whose score is within `gap`
+/// centipawns of the best, then picks one via a linear rank bias (`bias_index`): `bias_slope` tilts
+/// selection toward the WORSE eligible moves (0 = uniform; higher = the worst eligible move is chosen
+/// more often, worst:best odds = 1 + bias_slope; negative leans toward the best). Unlike
+/// `select_softmax` (which only *down-weights* the tail, so a wide pool can still occasionally cough
+/// up a clearly-losing move), this HARD-PRUNES every move more than `gap` below the best. That bounds
+/// the worst-case blunder and removes the "several decent + several horrible moves in one pool"
+/// randomness: with one standout move nothing else survives (forced best), while in a balanced
+/// position several near-equal moves survive and are chosen among by the bias. `gap <= 0`, a lone
+/// choice, or a decisive best (forced win/loss) all return the best move unchanged (full strength).
+///
+/// `always_allow` is an absolute "floor" (side-to-move cp): any move whose own score is at least
+/// `always_allow` stays eligible even if it falls outside the gap band (so a winning-but-not-best
+/// move can be played). It only ever *widens* the pool — the effective floor is
+/// `min(best_score - gap, always_allow)` — and never overrides the decisive-best guard above (which
+/// returns before this runs, so a solved win is never sampled away) nor the near-loss guard below.
+/// Pass `i32::MAX` to disable it.
+pub fn select_gap(
+    choices: &[(GameMove, i32)],
+    gap: i32,
+    bias_slope: f64,
+    always_allow: i32,
+    uniform01: f64,
+) -> Option<GameMove> {
+    let &(best, best_score) = choices.first()?;
+    if gap <= 0
+        || choices.len() < 2
+        || best_score > WIN_SCORE - 10
+        || best_score < LOSE_SCORE + 10
+    {
+        return Some(best);
+    }
+    // Survivors: within the tolerance band of the best OR at/above the always-allow floor, and not
+    // themselves a (near-)forced loss. min() folds the two floors into one (never raises the band).
+    let threshold = (best_score - gap).min(always_allow);
+    let survivors: Vec<GameMove> = choices
+        .iter()
+        .filter(|&&(_, s)| s >= threshold && s > LOSE_SCORE + 10)
+        .map(|&(m, _)| m)
+        .collect();
+    if survivors.len() < 2 {
+        return Some(best);
+    }
+    // Linear rank-biased pick over the best->worst-ordered survivors (bias_slope tilts toward worse).
+    Some(survivors[bias_index(survivors.len(), bias_slope, uniform01)])
+}
+
+/// Sample an index in [0, n-1] with weights rising linearly with rank: `w_i = 1 + slope * i/(n-1)`.
+/// `slope = 0` is uniform; `slope > 0` favors higher indices (worse-ranked moves), with worst:best
+/// odds = `1 + slope`; `slope < 0` favors the best (negative weights are clamped to 0). `u` is a
+/// uniform sample in [0, 1). n < 2 -> index 0.
+fn bias_index(n: usize, slope: f64, u: f64) -> usize {
+    if n < 2 {
+        return 0;
+    }
+    let denom = (n - 1) as f64;
+    let weights: Vec<f64> = (0..n)
+        .map(|i| (1.0 + slope * (i as f64 / denom)).max(0.0))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if !(total > 0.0) {
+        // Degenerate (e.g. every weight clamped to 0) -> uniform.
+        return ((u.clamp(0.0, 1.0) * n as f64) as usize).min(n - 1);
+    }
+    let mut target = u.clamp(0.0, 1.0) * total;
+    for (i, w) in weights.iter().enumerate() {
+        target -= w;
+        if target <= 0.0 {
+            return i;
+        }
+    }
+    n - 1
+}
+
+/// For logging: the selection probability of each ELIGIBLE root move under `select_gap` with the
+/// given `gap` and `bias_slope`. Returns `(choice_index, probability_in_[0,1])` for the survivors,
+/// best-first. Empty when weakening is inactive (gap <= 0, < 2 choices, a decisive best, or < 2
+/// survivors) — i.e. the best move is played with certainty. Mirrors `select_gap` + `bias_index`
+/// exactly so the logged % matches what actually gets sampled.
+pub fn selection_probabilities(
+    choices: &[(GameMove, i32)],
+    gap: i32,
+    bias_slope: f64,
+    always_allow: i32,
+) -> Vec<(usize, f64)> {
+    let best_score = match choices.first() {
+        Some(&(_, s)) => s,
+        None => return Vec::new(),
+    };
+    if gap <= 0
+        || choices.len() < 2
+        || best_score > WIN_SCORE - 10
+        || best_score < LOSE_SCORE + 10
+    {
+        return Vec::new();
+    }
+    let threshold = (best_score - gap).min(always_allow);
+    let survivors: Vec<usize> = choices
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, s))| s >= threshold && s > LOSE_SCORE + 10)
+        .map(|(i, _)| i)
+        .collect();
+    if survivors.len() < 2 {
+        return Vec::new();
+    }
+    let n = survivors.len();
+    let denom = (n - 1) as f64;
+    let weights: Vec<f64> = (0..n)
+        .map(|j| (1.0 + bias_slope * (j as f64 / denom)).max(0.0))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    survivors
+        .iter()
+        .enumerate()
+        .map(|(j, &ci)| {
+            let p = if total > 0.0 { weights[j] / total } else { 1.0 / n as f64 };
+            (ci, p)
+        })
+        .collect()
+}
+
+/// Half-window (cp) over which the dynamic gap ramps: eval <= -WINDOW => min, eval == 0 => std,
+/// eval >= +WINDOW => max. Retune here to widen/narrow the flex zone.
+pub const DYNAMIC_GAP_WINDOW: i32 = 50;
+
+/// Map the bot's current eval (cp, side-to-move relative: >0 = bot ahead) to an effective eval-gap.
+/// Piecewise-linear with a KINK at 0 (std is not assumed to be the midpoint of min/max):
+///   eval <= -WINDOW -> min (losing  => tightest gap => strongest play);
+///   eval == 0        -> std (even    => baseline);
+///   eval >= +WINDOW  -> max (winning => widest gap  => weakest play);
+///   -WINDOW..0 interpolates min..std, 0..+WINDOW interpolates std..max.
+pub fn dynamic_gap(eval_cp: i32, min: i32, std: i32, max: i32) -> i32 {
+    let w = DYNAMIC_GAP_WINDOW;
+    if eval_cp <= -w {
+        min
+    } else if eval_cp < 0 {
+        min + ((eval_cp + w) * (std - min)) / w
+    } else if eval_cp == 0 {
+        std
+    } else if eval_cp < w {
+        std + (eval_cp * (max - std)) / w
+    } else {
+        max
+    }
+}
+
+/// Dynamic-gap weakening: derive the gap from the best move's score (the bot's own eval) via
+/// `dynamic_gap`, then filter+sample as `select_gap`. Winning => wider gap (eases off); losing =>
+/// narrower (bears down). Decisive positions still return the best (guarded inside `select_gap`).
+pub fn select_gap_dynamic(
+    choices: &[(GameMove, i32)],
+    min: i32,
+    std: i32,
+    max: i32,
+    bias_slope: f64,
+    always_allow: i32,
+    uniform01: f64,
+) -> Option<GameMove> {
+    let &(_, best_score) = choices.first()?;
+    let gap = dynamic_gap(best_score, min, std, max);
+    select_gap(choices, gap, bias_slope, always_allow, uniform01)
 }
 
 #[derive(Clone)]
@@ -995,6 +1187,89 @@ mod test {
         // Edge cases: empty -> None; a single choice -> that choice.
         assert_eq!(select_softmax(&[], 100.0, 0.5), None);
         assert_eq!(select_softmax(&[(m_best, 0)], 100.0, 0.5), Some(m_best));
+    }
+    #[test]
+    fn gap_selection() {
+        let board = Board6::new();
+        let m_best = GameMove::try_from_ptn("a1", &board).unwrap();
+        let m_close = GameMove::try_from_ptn("f6", &board).unwrap();
+        let m_far = GameMove::try_from_ptn("c3", &board).unwrap();
+
+        // gap=50: m_close (within 50) survives and is reachable; m_far (120 below) is pruned.
+        // bias_slope 0.0 => uniform among survivors (so these mappings match the old behavior).
+        // always_allow = i32::MAX (disabled) throughout so only the gap band decides.
+        let none = i32::MAX;
+        let choices = [(m_best, 100), (m_close, 70), (m_far, -20)];
+        assert_eq!(select_gap(&choices, 50, 0.0, none, 0.0), Some(m_best));
+        assert_eq!(select_gap(&choices, 50, 0.0, none, 0.99), Some(m_close)); // never m_far
+        // Wider band admits m_far too, so the top of the uniform range lands on it.
+        assert_eq!(select_gap(&choices, 200, 0.0, none, 0.99), Some(m_far));
+        // gap=0 (off) and a lone standout best both force the best move.
+        assert_eq!(select_gap(&choices, 0, 0.0, none, 0.99), Some(m_best));
+        assert_eq!(select_gap(&[(m_best, 300), (m_close, -50)], 100, 0.0, none, 0.99), Some(m_best));
+        // A decisive best is never gambled, even with a huge gap.
+        let winning = [(m_best, WIN_SCORE - 1), (m_close, 50)];
+        assert_eq!(select_gap(&winning, 5000, 0.0, none, 0.99), Some(m_best));
+        // Edge cases mirror select_softmax.
+        assert_eq!(select_gap(&[], 100, 0.0, none, 0.5), None);
+        assert_eq!(select_gap(&[(m_best, 0)], 100, 0.0, none, 0.5), Some(m_best));
+    }
+    #[test]
+    fn gap_always_allow() {
+        let board = Board6::new();
+        let m_best = GameMove::try_from_ptn("a1", &board).unwrap();
+        let m_close = GameMove::try_from_ptn("f6", &board).unwrap();
+        let m_far = GameMove::try_from_ptn("c3", &board).unwrap();
+
+        // Best +300, m_far +80 sits 220 below best. gap=50 alone prunes it (threshold 250)...
+        let choices = [(m_best, 300), (m_close, 260), (m_far, 80)];
+        assert_eq!(select_gap(&choices, 50, 0.0, i32::MAX, 0.99), Some(m_close)); // m_far pruned
+        // ...but always_allow=50 lowers the floor to min(250, 50)=50, so m_far (+80) is now eligible
+        // and the top of the uniform range lands on it.
+        assert_eq!(select_gap(&choices, 50, 0.0, 50, 0.99), Some(m_far));
+        // always_allow never overrides the near-loss guard: a losing move stays out even if the
+        // floor would admit it. m_far at a forced loss is excluded; only best+m_close remain.
+        let with_loss = [(m_best, 300), (m_close, 260), (m_far, LOSE_SCORE + 1)];
+        assert_eq!(select_gap(&with_loss, 50, 0.0, -100000, 0.99), Some(m_close));
+        // always_allow never rescues a solved win from the decisive-best guard.
+        let winning = [(m_best, WIN_SCORE - 1), (m_close, 50)];
+        assert_eq!(select_gap(&winning, 5000, 0.0, -100000, 0.99), Some(m_best));
+        // A high always_allow is inert: min(band, high) = band, so behavior matches disabled.
+        assert_eq!(
+            select_gap(&choices, 50, 0.0, 1000, 0.99),
+            select_gap(&choices, 50, 0.0, i32::MAX, 0.99)
+        );
+    }
+    #[test]
+    fn bias_index_favors_worse() {
+        // slope 0 => uniform; either end reachable at the tails of u.
+        assert_eq!(bias_index(5, 0.0, 0.0), 0);
+        assert_eq!(bias_index(5, 3.0, 0.0), 0); // best still reachable at u=0
+        assert_eq!(bias_index(5, 3.0, 0.999), 4); // worst at the top of the range
+        // slope>0: probability rises with rank, so worst > middle > best in likelihood.
+        let width =
+            |sl: f64, i: usize| (0..2000).filter(|k| bias_index(5, sl, *k as f64 / 2000.0) == i).count();
+        assert!(width(3.0, 4) > width(3.0, 2), "worst beats middle");
+        assert!(width(3.0, 2) > width(3.0, 0), "middle beats best");
+        // n < 2 -> index 0.
+        assert_eq!(bias_index(1, 3.0, 0.7), 0);
+    }
+    #[test]
+    fn dynamic_gap_curve() {
+        // Advanced 5/10/20 across the +/-50 window (kink at 0, integer floor between).
+        assert_eq!(dynamic_gap(-100, 5, 10, 20), 5); // losing -> min
+        assert_eq!(dynamic_gap(-50, 5, 10, 20), 5); // edge -> min
+        assert_eq!(dynamic_gap(-25, 5, 10, 20), 7); // 5 + (25*5)/50 = 7
+        assert_eq!(dynamic_gap(0, 5, 10, 20), 10); // even -> std
+        assert_eq!(dynamic_gap(25, 5, 10, 20), 15); // 10 + (25*10)/50 = 15
+        assert_eq!(dynamic_gap(50, 5, 10, 20), 20); // edge -> max
+        assert_eq!(dynamic_gap(100, 5, 10, 20), 20); // winning -> max
+        // select_gap_dynamic reads choices[0] score as the eval; never gambles a decisive best.
+        let board = Board6::new();
+        let m_best = GameMove::try_from_ptn("a1", &board).unwrap();
+        let m_second = GameMove::try_from_ptn("f6", &board).unwrap();
+        let winning = [(m_best, WIN_SCORE - 1), (m_second, 50)];
+        assert_eq!(select_gap_dynamic(&winning, 5, 10, 20, 3.0, i32::MAX, 0.99), Some(m_best));
     }
     #[test]
     fn root_choices_populated_and_sampled() {

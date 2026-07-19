@@ -14,18 +14,28 @@ and connects out to the chosen server; each gets its own auto-restarting window.
 
 ## Ladder configs (baked into `run-ladder.ps1`)
 
-| Bot | Size | Nodes | AbortDepth | Temperature | MovePool | Time control |
-|---|---|---|---|---|---|---|
-| AdvancedBot6     | 6 | 55  | 1 | 0   | 5 | 10+n (600s) |
-| IntermediateBot6 | 6 | 55  | 1 | 70  | 5 | 10+n (600s) |
-| NoviceBot6       | 6 | 55  | 1 | 135 | 8 | 10+n (600s) |
-| AdvancedBot5     | 5 | 220 | 1 | 0   | 5 | 7+n (420s)  |
-| IntermediateBot5 | 5 | 220 | 1 | 165 | 5 | 7+n (420s)  |
-| NoviceBot5       | 5 | 220 | 1 | 320 | 8 | 7+n (420s)  |
+Weakening is a DYNAMIC eval-gap (Min/Std/Max cp): gap flexes with the bot's eval — Min at <=-50cp
+(losing => strongest), Std at 0cp (even), Max at >=+50cp (winning => weakest). Same triples both sizes.
 
-Weakening = Temperature (softmax over the top `MovePool` root moves) + pool width. Configs are
-offline starting points (+/-~70 Elo noise) - nudge Temperature on the live ladder. `+n` = increment
-scales with move number (base increment 1s).
+| Bot | Size | Nodes | AbortDepth | GapMin/Std/Max | MovePool | Time control |
+|---|---|---|---|---|---|---|
+| AdvancedBot6     | 6 | 500000 | 1 | 20/30/40  | 16 | 10+n (600s) |
+| IntermediateBot6 | 6 | 500000 | 1 | 40/50/60  | 16 | 10+n (600s) |
+| NoviceBot6       | 6 | 500000 | 1 | 60/80/100 | 16 | 10+n (600s) |
+| AdvancedBot5     | 5 | 400000 | 1 | 20/30/40  | 16 | 7+n (420s)  |
+| IntermediateBot5 | 5 | 400000 | 1 | 40/50/60  | 16 | 7+n (420s)  |
+| NoviceBot5       | 5 | 400000 | 1 | 60/80/100 | 16 | 7+n (420s)  |
+
+The gap (a.k.a. "drop rate") prunes root moves more than `gap` cp below the best, then picks among the
+survivors with a linear rank bias (`BiasSlope`, shared across levels for now, decimal ok): 0 = uniform,
+higher tilts toward the WORSE eligible moves (worst:best odds = 1 + BiasSlope). `-AlwaysAllow N` sets an
+absolute floor: any move scoring >= N cp stays eligible even if it falls outside the gap band (widens the
+pool only; never overrides a solved/decisive position or plays a losing move). Large default = disabled. Over a pool-16 MultiPV (max 16). White forces a
+random corner; Black's first reply picks an archetype (now equal-weighted). BiasSlope is per-level in
+run-ladder ($b.Slope); currently 8 for both sizes. Nodes per-size (6x6=50k, 5x5=40k); levels differ by gap. The dynamic gap makes the bot ease off when winning and bear down when losing,
+flexing around a roughly static level. Values are MANUAL (slatebot calibration was judged
+unrepresentative) - tune the triples live off ratings/feel (higher = weaker). `+n` = increment scales
+with move number (base increment 1s).
 
 ---
 
@@ -82,11 +92,11 @@ template: `{user}` is replaced by each bot's username, so set each account's pas
 ## Common tweaks
 
 ```powershell
-# Re-tune ONE level after watching its live rating (raise Temperature to weaken, lower to strengthen).
-# Relaunch just that bot with the override; e.g. make NoviceBot6 a bit stronger (T 135 -> 110):
-.\run-gembot.ps1 -User NoviceBot6 -Pass "NoviceBot6<suffix>" -Size 6 -Temperature 110 -MovePool 8 -ServerHost beta.playtak.com -Port 10002 -Rated
+# Re-tune ONE level after watching its live rating (raise the gap triple to weaken, lower to strengthen).
+# Relaunch just that bot with the override; e.g. make NoviceBot6 a bit stronger (20/40/60 -> 15/30/45):
+.\run-gembot.ps1 -User NoviceBot6 -Pass "NoviceBot6<suffix>" -Size 6 -EvalGapMin 15 -EvalGapStd 30 -EvalGapMax 45 -MovePool 16 -ServerHost beta.playtak.com -Port 10002 -Rated
 
-# Run a single Advanced bot at full strength (Temperature 0 is the default):
+# Run a single bot at FULL strength (EvalGap 0 is the default => no weakening):
 .\run-gembot.ps1 -User AdvancedBot5 -Pass "AdvancedBot5<suffix>" -Size 5 -ServerHost beta.playtak.com -Port 10002 -Rated
 
 # Override the time control for one bot (e.g. 6x6 at 5+n instead of 10+n):

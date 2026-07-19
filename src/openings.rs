@@ -75,6 +75,19 @@ const CORNERS: [&str; 4] = ["a1", "a6", "f1", "f6"];
 
 pub const NUM_ARCHETYPES: usize = 5;
 
+/// Index of the center-stack archetype (see `archetype_name`). Self-play showed it is too
+/// Black-favoured to be a viable line, so books for training/balance work exclude it and use only
+/// the 4 corner archetypes.
+pub const CENTER_STACK: usize = 4;
+
+/// Uniform weights over the 4 corner archetypes (diagonal, adjacent, hug, gap-hug), with
+/// center-stack zeroed out. Black-stack mode only — standard mode has no center-stack archetype.
+pub fn corner_archetype_weights() -> Vec<f64> {
+    let mut w = vec![1.0; NUM_ARCHETYPES];
+    w[CENTER_STACK] = 0.0;
+    w
+}
+
 /// Human-readable name for an archetype index (matches pick_instance's ordering).
 pub fn archetype_name(i: usize) -> &'static str {
     match i {
@@ -147,6 +160,10 @@ pub struct OpeningsConfig {
     /// of the `2xx` double-black-stack, and only the diagonal-corner / adjacent-corner / hug
     /// archetypes are used (no gap-hug or center-stack).
     pub standard: bool,
+    /// Exclude the center-stack archetype, emitting only the 4 corner archetypes. No-op in
+    /// `standard` mode, which has no center-stack archetype. The 4-archetype book saturates at
+    /// **348,432** unique D4-deduped positions (measured; see `openings_archetype_ceiling`).
+    pub no_center_stack: bool,
 }
 
 impl Default for OpeningsConfig {
@@ -156,6 +173,7 @@ impl Default for OpeningsConfig {
             tps_path: "6s_black_stack_openings.tps".to_string(),
             ptn_path: "6s_black_stack_openings.ptn".to_string(),
             standard: false,
+            no_center_stack: false,
         }
     }
 }
@@ -414,13 +432,17 @@ pub fn generate_weighted(
     let mut attempts = 0usize;
 
     while out.len() < count {
-        // Choose this slot's archetype by smooth weighted round-robin.
+        // Choose this slot's archetype by smooth weighted round-robin. Archetypes with a
+        // non-positive weight are excluded outright: their credit never grows, but the active ones
+        // go negative when charged `total_w`, so without this filter a zero-weight archetype's
+        // stationary 0.0 would eventually be the maximum and get picked anyway.
         for (a, w) in weights.iter().enumerate() {
             credit[a] += w;
         }
         let pick = (0..num_arch)
+            .filter(|&a| weights[a] > 0.0)
             .max_by(|&x, &y| credit[x].partial_cmp(&credit[y]).unwrap())
-            .unwrap();
+            .expect("at least one archetype must have a positive weight");
         credit[pick] -= total_w;
 
         // Generate a unique opening of that archetype (retry on dup/collision).
@@ -453,7 +475,11 @@ pub fn generate(count: usize, standard: bool) -> Vec<(String, String, usize)> {
 
 /// Generate the book and write both files. Returns the number of unique openings written.
 pub fn run(cfg: OpeningsConfig) -> io::Result<usize> {
-    let openings = generate(cfg.count, cfg.standard);
+    let openings = if cfg.no_center_stack && !cfg.standard {
+        generate_weighted(cfg.count, false, &corner_archetype_weights())
+    } else {
+        generate(cfg.count, cfg.standard)
+    };
 
     // Self-check: every emitted TPS must parse back through Topaz's own parser.
     for (tps, _, _) in &openings {
@@ -503,9 +529,23 @@ mod test {
                 .to_string_lossy()
                 .into_owned(),
             standard: false,
+            no_center_stack: false,
         };
         let n = run(cfg).unwrap();
         assert_eq!(n, 50);
+    }
+
+    #[test]
+    fn no_center_stack_excludes_center_archetype() {
+        // Every corner-only opening's ply 1 lands on a corner; center-stack (index 4) puts White's
+        // stack on a central square, so its absence is verifiable from the generated positions.
+        let openings =
+            generate_weighted(200, false, &corner_archetype_weights());
+        assert_eq!(openings.len(), 200);
+        assert!(
+            openings.iter().all(|(_, _, arch)| *arch != CENTER_STACK),
+            "corner-only book must contain no center-stack openings"
+        );
     }
 
     #[test]
@@ -594,5 +634,55 @@ mod test {
             let board = Board6::try_from_tps(&tps).unwrap();
             assert!(board.move_num() >= 2);
         }
+    }
+
+    /// Measurement harness, not a correctness test. Rejection-samples each archetype on its own to
+    /// saturation and reports its D4-unique ceiling. Measured per-archetype rather than through
+    /// `generate_weighted` because that fn picks an archetype *before* its retry loop and then spins
+    /// on that same archetype until it finds a unique — so once the smallest archetype saturates it
+    /// stalls the whole run against `max_attempts` and the total never reflects the real ceiling.
+    ///
+    /// Run: cargo test --release openings_archetype_ceiling -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn openings_archetype_ceiling() {
+        // Consecutive dup attempts with no new position before we call an archetype saturated.
+        const STALL: usize = 2_000_000;
+        let all_sq = all_squares();
+        let interior_sq = interior_squares();
+        let mut grand = 0usize;
+        let mut corner_total = 0usize;
+
+        for arch in 0..NUM_ARCHETYPES {
+            let mut rng = new_rng();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut since_new = 0usize;
+            let mut attempts = 0usize;
+            while since_new < STALL {
+                attempts += 1;
+                let fresh = build_opening(arch, &all_sq, &interior_sq, false, &mut rng)
+                    .map(|(tps, _)| seen.insert(canonical_key(&tps)))
+                    .unwrap_or(false);
+                if fresh {
+                    since_new = 0;
+                } else {
+                    since_new += 1;
+                }
+            }
+            println!(
+                "{:<18} {:>9} unique   ({:>10} attempts)",
+                archetype_name(arch),
+                seen.len(),
+                attempts
+            );
+            grand += seen.len();
+            // Archetypes 0-3 are the corner openings; 4 is center-stack (being dropped).
+            if arch < 4 {
+                corner_total += seen.len();
+            }
+        }
+        println!("---");
+        println!("4 corner archetypes (no center-stack): {corner_total}");
+        println!("all {NUM_ARCHETYPES} archetypes:                  {grand}");
     }
 }

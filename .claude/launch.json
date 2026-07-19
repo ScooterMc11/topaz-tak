@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bot-manager-server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "bot-manager-app/server", "run", "dev"],
+      "port": 4317
+    },
+    {
+      "name": "bot-manager-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "bot-manager-app/web", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}
