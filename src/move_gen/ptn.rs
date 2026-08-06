@@ -125,7 +125,35 @@ impl GameMove {
         }
     }
     pub fn try_from_ptn<T: TakBoard>(s: &str, board: &T) -> Option<Self> {
-        Self::try_from_ptn_m(s, T::SIZE, board.side_to_move())
+        let mv = Self::try_from_ptn_m(s, T::SIZE, board.side_to_move())?;
+        Some(mv.infer_crush(board))
+    }
+    /// Set the crush flag on a spread that must be one, whether or not the PTN said so.
+    ///
+    /// The `*` marking a wall smash is **optional** in PTN, and plenty of sources leave it off —
+    /// notably anything converted from PlayTak's move format, which has no notion of it (see
+    /// `try_from_playtak`, which infers it the same way). Without this, a perfectly valid `c4-` or
+    /// `1c4-1` parses to a non-crushing move that then fails to match any legal move.
+    ///
+    /// Only a lone capstone landing on a wall can be a crush, so inferring it here can't turn a
+    /// legal non-crush into something else. A move that fails those tests is left alone and, if it
+    /// really was illegal, still fails the caller's legality check.
+    fn infer_crush<T: TakBoard>(self, board: &T) -> Self {
+        if !self.is_stack_move() || self.crush() {
+            return self;
+        }
+        match board.index(self.src_index()).top() {
+            Some(p) if p.is_cap() => {}
+            _ => return self,
+        }
+        let last = match self.quantity_iter(T::SIZE).last() {
+            Some(q) if q.quantity == 1 => q,
+            _ => return self,
+        };
+        match board.index(last.index).top() {
+            Some(p) if p.is_wall() => self.set_crush(),
+            _ => self,
+        }
     }
     pub fn try_from_ptn_m(s: &str, size: usize, active_player: Color) -> Option<Self> {
         let mut iter = s.chars().take_while(|&c| c != '*');
@@ -307,6 +335,27 @@ mod test {
         assert_eq!(board.pieces_reserve(Color::Black), flats);
         assert_eq!(board.pieces_reserve(Color::White), flats);
         assert!(board.board[idx].is_empty());
+    }
+    #[test]
+    pub fn crush_without_asterisk() {
+        // White capstone on c4, Black wall below it on c3, and a lone White flat on a1.
+        let board =
+            Board6::try_from_tps("x6/x6/x2,1C,x3/x2,2S,x3/x6/1,x5 1 10").unwrap();
+        // Every spelling of "smash it" has to give the same move — the `*` and both counts are
+        // optional, and PlayTak-derived move lists write none of them.
+        let starred = GameMove::try_from_ptn("c4-*", &board).unwrap();
+        assert!(starred.crush());
+        assert!(board.legal_move(starred));
+        for ptn in ["c4-", "1c4-", "c4-1", "1c4-1"] {
+            let m = GameMove::try_from_ptn(ptn, &board).unwrap();
+            assert!(m.crush(), "{} should parse as a crush", ptn);
+            assert_eq!(m, starred, "{} should equal c4-*", ptn);
+            assert!(board.legal_move(m), "{} should be legal", ptn);
+        }
+        // A spread that isn't a lone capstone landing on a wall is left exactly as written.
+        let plain = GameMove::try_from_ptn("a1+", &board).unwrap();
+        assert!(!plain.crush());
+        assert!(board.legal_move(plain));
     }
     #[test]
     pub fn playtak_move() {

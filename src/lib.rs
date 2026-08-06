@@ -11,6 +11,8 @@ pub mod balance4;
 #[cfg(all(feature = "evaluation", feature = "random"))]
 pub mod balance5;
 #[cfg(feature = "evaluation")]
+pub mod analyze_game;
+#[cfg(feature = "evaluation")]
 pub mod balanced_lines;
 pub mod board;
 #[cfg(feature = "evaluation")]
