@@ -197,13 +197,17 @@ where
                 ));
             }
             if is_multi_pv {
+                // No PV move at this index means there is no further distinct root move to find —
+                // the position has fewer legal moves than the requested PV count, or this PV search
+                // returned nothing. Stop enumerating rather than indexing an empty PV.
+                let Some(&pv_root) = pv_moves.first() else { break };
                 outcomes.push(SearchOutcome::new(
                     best_score,
                     pv_moves.clone(),
                     depth,
                     info,
                 ));
-                info.forbidden_root_moves.try_append(pv_moves[0]);
+                info.forbidden_root_moves.try_append(pv_root);
             }
             if !info.quiet {
                 if is_multi_pv && pv_idx == num_pvs - 1 {

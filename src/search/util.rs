@@ -162,6 +162,11 @@ impl<'a> SearchInfo<'a> {
         self.capture_hist.clear();
         self.pv_table.clear();
         self.depth_scores.clear();
+        // Both of these are only ever *written* when a depth completes, so without this a search
+        // that completes no depth at all would leave the previous search's values in place — and a
+        // caller reusing one `SearchInfo` across positions (analyze_game) would read root moves that
+        // are illegal in the position it just searched.
+        self.root_choices.clear();
     }
     pub fn take_input_stream(&mut self) -> Option<Receiver<TeiCommand>> {
         self.input.take()

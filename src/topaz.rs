@@ -50,6 +50,37 @@ static SAVED_TPS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     x
 });
 
+/// Pull the ply list out of loose PTN text: strips `[Header "..."]` lines, `{comments}`, move
+/// numbers (`12.`), placeholder plies (`--`), result tokens and per-ply annotations (`!?`).
+/// Used by `analyzegame`, which accepts either a bare ply list or a whole PTN document.
+fn parse_ply_list(text: &str) -> Vec<String> {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut in_header = false;
+    let mut in_comment = false;
+    for c in text.chars() {
+        match c {
+            '[' => in_header = true,
+            ']' if in_header => in_header = false,
+            '{' => in_comment = true,
+            '}' if in_comment => in_comment = false,
+            _ if in_header || in_comment => {}
+            ',' => cleaned.push(' '),
+            _ => cleaned.push(c),
+        }
+    }
+    cleaned
+        .split_whitespace()
+        .filter(|t| {
+            !t.is_empty()
+                && *t != "--"
+                && !t.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && !matches!(*t, "R-0" | "0-R" | "F-0" | "0-F" | "1-0" | "0-1" | "1/2-1/2" | "0-0")
+        })
+        .map(|t| t.trim_end_matches(['?', '!', '\'', '"']).to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 pub fn main() {
     let args: Vec<String> = env::args().collect();
     if let Some(arg1) = args.get(1) {
@@ -187,6 +218,72 @@ pub fn main() {
                 }
                 Ok(_) => println!("gapcompare currently supports 6x6 positions only"),
                 Err(e) => println!("bad tps: {}", e),
+            }
+            return;
+        } else if arg1 == "analyzegame" {
+            // Whole-game analysis for TakAnalyzerBot's /analyze sheet: per-ply evals + game stats,
+            // printed as JSON. Plies come from --plies, --file (a PTN file), or trailing arguments.
+            let mut opts = Options::new();
+            opts.optopt("s", "size", "Board size: 4, 5 or 6 (default 6)", "N");
+            opts.optopt("k", "halfkomi", "Half-komi; 2 komi == 4 (default 0)", "N");
+            opts.optopt("n", "nodes", "Node budget per position (default 100000)", "N");
+            opts.optopt("p", "plies", "Whitespace- or comma-separated plies", "PTN");
+            opts.optopt("f", "file", "Read plies from a PTN file", "PATH");
+            opts.optopt("o", "output", "JSON output path (default stdout)", "PATH");
+            opts.optopt(
+                "g",
+                "grading",
+                "Loss measurement: aligned (default, 1 search/ply), sibling (2), both",
+                "MODE",
+            );
+            opts.optflag("q", "quiet", "Suppress per-ply progress on stderr");
+            opts.optflag("h", "help", "Print this help menu");
+            let matches = match opts.parse(&args[2..]) {
+                Ok(m) => m,
+                Err(f) => {
+                    panic!("{}", f.to_string())
+                }
+            };
+            if matches.opt_present("h") {
+                println!("{}", opts.usage("Usage: topaz analyzegame [options] [ply ...]"));
+                return;
+            }
+            let default = topaz_tak::analyze_game::AnalyzeGameConfig::default();
+            let mut ply_text = matches.opt_str("p").unwrap_or_default();
+            if let Some(path) = matches.opt_str("f") {
+                let data = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+                ply_text.push(' ');
+                ply_text.push_str(&data);
+            }
+            for free in matches.free.iter() {
+                ply_text.push(' ');
+                ply_text.push_str(free);
+            }
+            // Tolerate a whole PTN body: drop headers, comments, move numbers and the result token.
+            let plies = parse_ply_list(&ply_text);
+            let grading = match matches.opt_str("g") {
+                Some(text) => match topaz_tak::analyze_game::Grading::parse(&text) {
+                    Some(g) => g,
+                    None => {
+                        eprintln!("analyzegame: unknown grading mode '{text}'");
+                        std::process::exit(1);
+                    }
+                },
+                None => default.grading,
+            };
+            let cfg = topaz_tak::analyze_game::AnalyzeGameConfig {
+                size: matches.opt_get_default("s", default.size).unwrap(),
+                half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
+                nodes: matches.opt_get_default("n", default.nodes).unwrap(),
+                plies,
+                output: matches.opt_str("o"),
+                quiet: matches.opt_present("q"),
+                grading,
+            };
+            if let Err(e) = topaz_tak::analyze_game::run(cfg) {
+                eprintln!("analyzegame: {e}");
+                std::process::exit(1);
             }
             return;
         } else if arg1 == "balancedlines" {
@@ -2014,8 +2111,16 @@ fn playtak_loop(
                                     if let Some(rest) = rest {
                                         if rest.starts_with('P') || rest.starts_with('M') {
                                             moves.push(rest.to_string());
-                                        } else if rest.starts_with("Over") {
-                                            // Todo maybe a different command?
+                                        } else if rest.starts_with("Over")
+                                            || rest.starts_with("Abandoned")
+                                        {
+                                            // Two ways a game ends. "Over <result>" is the normal
+                                            // one; "Abandoned. <user> quit" is what the server sends
+                                            // when the opponent disconnects and doesn't come back —
+                                            // there is NO Over line for that, so it must reset the
+                                            // session too or the bot sits "in game" forever, never
+                                            // re-seeking (the opponent's move it's waiting on is
+                                            // never coming).
                                             let _ = engine_send.send(TeiCommand::NewGame(0));
                                             counter = 0;
                                             playing = false;
