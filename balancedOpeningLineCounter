@@ -14,6 +14,11 @@
 # archetype (table layout). --requireBoth counts only the intersection (bar layout) and prunes harder.
 # Output: one PNG in balancedOpeningLineCounterResults/.
 #
+# RESUMABLE: results are checkpointed after each opening archetype finishes. The output name is keyed
+# to the config (no timestamp), so re-running the SAME command after a crash/reboot automatically
+# resumes -- already-finished archetypes are skipped. Pass --fresh to discard the checkpoint and start
+# over.
+#
 # Usage:
 #   ./balancedOpeningLineCounter -d <depth> -p <plies> -b <cpBounds>
 #   ./balancedOpeningLineCounter -d <depth> -p <plies> -b <cpBounds> -r <relativeBounds> [-rtt] [-rb]
@@ -25,6 +30,7 @@
 #   -r,   --relativeBounds   Relative balance bound in human cp (integer >= 0). Optional.
 #   -rtt, --relativeToTop    Anchor the relative band to the per-ply top move (needs -r). Flag.
 #   -rb,  --requireBoth      Count only lines both absolutely and relatively balanced (needs -b and -r). Flag.
+#   -f,   --fresh            Ignore/delete any existing checkpoint and start this config over. Flag.
 #   At least one of -b / -r is required.
 #
 set -euo pipefail
@@ -36,7 +42,7 @@ RESULTS_DIR="balancedOpeningLineCounterResults"
 RENDERER="render_balanced_lines.py"
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -46,6 +52,7 @@ BOUND=""
 RELBOUND=""
 RTT=0
 RB=0
+FRESH=0
 
 # --- parse args (supports short/long, and --name=value) ---
 while [[ $# -gt 0 ]]; do
@@ -60,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --relativeBounds=*)     RELBOUND="${1#*=}"; shift ;;
         -rtt|--relativeToTop)   RTT=1; shift ;;
         -rb|--requireBoth)      RB=1; shift ;;
+        -f|--fresh)             FRESH=1; shift ;;
         -h|--help)              usage 0 ;;
         *) echo "error: unknown argument '$1'" >&2; usage 1 ;;
     esac
@@ -89,15 +97,23 @@ done
 [[ -n "$PY" ]] || fail "no python interpreter found (need python with Pillow installed)"
 
 mkdir -p "$RESULTS_DIR"
-STAMP="$(date +%Y%m%d-%H%M%S)"
+# Stable, config-keyed name (no timestamp) so re-running the same config auto-resumes its checkpoint.
 NAME="balanced_d${DEPTH}_p${PLIES}"
 [[ -n "$BOUND" ]] && NAME="${NAME}_b${BOUND}"
 [[ -n "$RELBOUND" ]] && NAME="${NAME}_r${RELBOUND}"
 (( RTT == 1 )) && NAME="${NAME}_rtt"
 (( RB == 1 )) && NAME="${NAME}_rb"
-BASE="${NAME}_${STAMP}"
+BASE="${NAME}"
 JSON="${RESULTS_DIR}/${BASE}.json"
 PNG="${RESULTS_DIR}/${BASE}.png"
+
+if (( FRESH == 1 )); then
+    rm -f "$JSON" "${JSON}.progress"
+    echo "==> Fresh run: removed any existing checkpoint for this config."
+elif [[ -f "${JSON}.progress" ]]; then
+    echo "==> Resuming: found a checkpoint (${JSON}.progress) for this config; completed archetypes are skipped."
+    echo "    (Pass --fresh to start over instead.)"
+fi
 
 TOPAZ="./target/release/topaz.exe"
 [[ -x "$TOPAZ" || -f "$TOPAZ" ]] || TOPAZ="./target/release/topaz"

@@ -227,7 +227,9 @@ fn should_explore(b: Bounds, still_abs: bool, still_rel: bool) -> bool {
 }
 
 /// Per-(ruleset, archetype) accumulator, shared across worker threads. The three sets hold the
-/// **distinct D4-canonical end-state keys** for each band; the reported count is `set.len()`.
+/// **distinct D4-canonical end-state keys** for each band while the archetype is being computed. When
+/// it finishes (or is loaded from a checkpoint) `complete` is set and the final counts are frozen into
+/// `ck_*`, so the count accessors report the frozen value (the sets are empty for a resumed archetype).
 struct ArchAgg {
     name: &'static str,
     abs_set: Mutex<HashSet<u64>>,
@@ -240,6 +242,11 @@ struct ArchAgg {
     dead: AtomicBool,
     /// Opening eval anchor, White-perspective, internal cp (set in phase 1, read by workers).
     base_white: AtomicI32,
+    /// This archetype's work is finished; `ck_*` hold its final counts (for checkpoint/resume).
+    complete: AtomicBool,
+    ck_abs: AtomicU64,
+    ck_rel: AtomicU64,
+    ck_both: AtomicU64,
 }
 
 impl ArchAgg {
@@ -254,16 +261,51 @@ impl ArchAgg {
             tasks_total: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             base_white: AtomicI32::new(0),
+            complete: AtomicBool::new(false),
+            ck_abs: AtomicU64::new(0),
+            ck_rel: AtomicU64::new(0),
+            ck_both: AtomicU64::new(0),
         }
     }
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Relaxed)
+    }
     fn abs_count(&self) -> u64 {
-        self.abs_set.lock().unwrap().len() as u64
+        if self.is_complete() {
+            self.ck_abs.load(Ordering::Relaxed)
+        } else {
+            self.abs_set.lock().unwrap().len() as u64
+        }
     }
     fn rel_count(&self) -> u64 {
-        self.rel_set.lock().unwrap().len() as u64
+        if self.is_complete() {
+            self.ck_rel.load(Ordering::Relaxed)
+        } else {
+            self.rel_set.lock().unwrap().len() as u64
+        }
     }
     fn both_count(&self) -> u64 {
-        self.both_set.lock().unwrap().len() as u64
+        if self.is_complete() {
+            self.ck_both.load(Ordering::Relaxed)
+        } else {
+            self.both_set.lock().unwrap().len() as u64
+        }
+    }
+    /// Freeze the current set sizes as the final counts and mark the archetype complete.
+    fn finalize(&self) {
+        self.ck_abs.store(self.abs_set.lock().unwrap().len() as u64, Ordering::Relaxed);
+        self.ck_rel.store(self.rel_set.lock().unwrap().len() as u64, Ordering::Relaxed);
+        self.ck_both.store(self.both_set.lock().unwrap().len() as u64, Ordering::Relaxed);
+        self.complete.store(true, Ordering::Relaxed);
+    }
+    /// Restore a completed archetype from a checkpoint (no recomputation needed).
+    fn load_checkpoint(&self, dead: bool, base_white: i32, abs: u64, rel: u64, both: u64) {
+        self.dead.store(dead, Ordering::Relaxed);
+        self.base_white.store(base_white, Ordering::Relaxed);
+        self.ck_abs.store(abs, Ordering::Relaxed);
+        self.ck_rel.store(rel, Ordering::Relaxed);
+        self.ck_both.store(both, Ordering::Relaxed);
+        self.complete.store(true, Ordering::Relaxed);
     }
 }
 
@@ -605,65 +647,76 @@ fn run_round(
     collected
 }
 
-/// Enumerate one ruleset: base-check every archetype and seed ply-3 tasks (phase 1), then run round 1
-/// (seeds) and round 2 (any spawned ply-4 tasks).
+/// Enumerate one ruleset, **one archetype at a time**, so results can be checkpointed at each
+/// archetype boundary (each archetype still saturates all cores via its ~hundreds of seed tasks).
+/// A completed (or checkpoint-restored) archetype is skipped. After each archetype finishes, the full
+/// results JSON + resume checkpoint are written, so an interrupted run keeps every finished archetype.
 fn run_ruleset(rs: &Ruleset, cfg: &BalancedLinesConfig, bounds: Bounds, aggs: &Arc<Vec<ArchAgg>>) {
-    let mut seeds: VecDeque<Task> = VecDeque::new();
-    {
-        let table = HashTable::new(BAL_TT_SIZE);
-        let mut eval = NNUE6::default();
-        let mut info = make_info(cfg.depth, &table);
-        for arch_idx in 0..rs.num_arch {
-            let agg = &aggs[rs.agg_base + arch_idx];
+    for arch_idx in 0..rs.num_arch {
+        let agg = &aggs[rs.agg_base + arch_idx];
+        if agg.is_complete() {
+            continue; // restored from checkpoint
+        }
+
+        // Phase 1 (this archetype only): base check + seed generation.
+        let mut seeds: VecDeque<Task> = VecDeque::new();
+        let mut finished = false;
+        {
+            let table = HashTable::new(BAL_TT_SIZE);
+            let mut eval = NNUE6::default();
+            let mut info = make_info(cfg.depth, &table);
             let mut board = Board6::new().with_komi(rs.komi);
             apply_opening(&mut board, arch_idx, rs.double);
 
             if board.game_result().is_some() {
                 agg.dead.store(true, Ordering::Relaxed);
-                continue;
-            }
-            let base_white = eval_white(&mut board, &mut eval, &mut info);
-            agg.evals.fetch_add(1, Ordering::Relaxed);
-            agg.base_white.store(base_white, Ordering::Relaxed);
+                finished = true;
+            } else {
+                let base_white = eval_white(&mut board, &mut eval, &mut info);
+                agg.evals.fetch_add(1, Ordering::Relaxed);
+                agg.base_white.store(base_white, Ordering::Relaxed);
 
-            if bounds.want_abs && base_white.abs() > bounds.abs_bound.unwrap() {
-                agg.dead.store(true, Ordering::Relaxed);
-                continue;
-            }
-            if cfg.plies <= 2 {
-                // The opening itself is the whole (single) balanced end-state.
-                let key = canonical_board_key(&board);
-                if bounds.require_both {
-                    agg.both_set.lock().unwrap().insert(key);
-                } else {
-                    if bounds.want_abs {
-                        agg.abs_set.lock().unwrap().insert(key);
-                    }
-                    if bounds.want_rel {
-                        agg.rel_set.lock().unwrap().insert(key);
-                    }
-                    if bounds.want_abs && bounds.want_rel {
+                if bounds.want_abs && base_white.abs() > bounds.abs_bound.unwrap() {
+                    agg.dead.store(true, Ordering::Relaxed);
+                    finished = true;
+                } else if cfg.plies <= 2 {
+                    // The opening itself is the whole (single) balanced end-state.
+                    let key = canonical_board_key(&board);
+                    if bounds.require_both {
                         agg.both_set.lock().unwrap().insert(key);
+                    } else {
+                        if bounds.want_abs {
+                            agg.abs_set.lock().unwrap().insert(key);
+                        }
+                        if bounds.want_rel {
+                            agg.rel_set.lock().unwrap().insert(key);
+                        }
+                        if bounds.want_abs && bounds.want_rel {
+                            agg.both_set.lock().unwrap().insert(key);
+                        }
+                    }
+                    finished = true;
+                } else {
+                    let mut moves: Vec<GameMove> = Vec::with_capacity(128);
+                    generate_all_place_moves(&board, &mut moves);
+                    agg.tasks_total.store(moves.len() as u64, Ordering::Relaxed);
+                    for mv in moves {
+                        seeds.push_back(Task::Seed { arch_idx, ply3: mv });
                     }
                 }
-                continue;
-            }
-            let mut moves: Vec<GameMove> = Vec::with_capacity(128);
-            generate_all_place_moves(&board, &mut moves);
-            agg.tasks_total.store(moves.len() as u64, Ordering::Relaxed);
-            for mv in moves {
-                seeds.push_back(Task::Seed { arch_idx, ply3: mv });
             }
         }
-    }
-    if seeds.is_empty() {
-        return;
-    }
 
-    // Round 1: ply-3 seeds (may spawn ply-4 tasks). Round 2: those ply-4 tasks.
-    let nodes = run_round(seeds, rs, cfg, bounds, aggs);
-    if !nodes.is_empty() {
-        run_round(VecDeque::from(nodes), rs, cfg, bounds, aggs);
+        if !finished {
+            // Round 1: ply-3 seeds (may spawn ply-4 tasks). Round 2: those ply-4 tasks.
+            let nodes = run_round(seeds, rs, cfg, bounds, aggs);
+            if !nodes.is_empty() {
+                run_round(VecDeque::from(nodes), rs, cfg, bounds, aggs);
+            }
+        }
+
+        agg.finalize();
+        save_all(cfg, bounds, aggs);
     }
 }
 
@@ -760,8 +813,9 @@ fn write_json(cfg: &BalancedLinesConfig, b: Bounds, aggs: &[ArchAgg]) -> io::Res
             let a = &aggs[rs.agg_base + arch_idx];
             let opening_cp = a.base_white.load(Ordering::Relaxed) as f64 / 4.0;
             arch_json.push(format!(
-                "{{\"name\": \"{}\", \"dead\": {}, \"opening_cp\": {:.1}, \"abs\": {}, \"rel\": {}, \"both\": {}}}",
+                "{{\"name\": \"{}\", \"complete\": {}, \"dead\": {}, \"opening_cp\": {:.1}, \"abs\": {}, \"rel\": {}, \"both\": {}}}",
                 a.name,
+                a.is_complete(),
                 a.dead.load(Ordering::Relaxed),
                 opening_cp,
                 a.abs_count(),
@@ -779,8 +833,100 @@ fn write_json(cfg: &BalancedLinesConfig, b: Bounds, aggs: &[ArchAgg]) -> io::Res
         ));
     }
     s.push_str("  }\n}\n");
-    std::fs::write(&cfg.output, s)?;
-    Ok(())
+    atomic_write(&cfg.output, &s)
+}
+
+/// Write `content` to `path` atomically: write a sibling `.tmp` then rename over `path`, so a process
+/// killed mid-write can never leave a half-written (corrupt) results/checkpoint file.
+fn atomic_write(path: &str, content: &str) -> io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// A stable signature of the run config, so a checkpoint is only ever resumed for an identical config.
+fn config_sig(cfg: &BalancedLinesConfig) -> String {
+    format!(
+        "depth={} plies={} cp_bound={} rel_bound={} rtt={} rb={}",
+        cfg.depth,
+        cfg.plies,
+        opt_num(cfg.cp_bound),
+        opt_num(cfg.rel_bound),
+        cfg.relative_to_top as u8,
+        cfg.require_both as u8,
+    )
+}
+
+/// Checkpoint sidecar path for a given output JSON path.
+fn checkpoint_path(cfg: &BalancedLinesConfig) -> String {
+    format!("{}.progress", cfg.output)
+}
+
+/// Write the resume checkpoint: a config signature line, then one line per archetype
+/// (`idx complete dead base_white abs rel both`). Only `complete` archetypes are ever restored.
+fn write_checkpoint(cfg: &BalancedLinesConfig, aggs: &[ArchAgg]) -> io::Result<()> {
+    let mut s = format!("sig {}\n", config_sig(cfg));
+    for (i, a) in aggs.iter().enumerate() {
+        s.push_str(&format!(
+            "{} {} {} {} {} {} {}\n",
+            i,
+            a.is_complete() as u8,
+            a.dead.load(Ordering::Relaxed) as u8,
+            a.base_white.load(Ordering::Relaxed),
+            a.abs_count(),
+            a.rel_count(),
+            a.both_count(),
+        ));
+    }
+    atomic_write(&checkpoint_path(cfg), &s)
+}
+
+/// Restore completed archetypes from the checkpoint sidecar (if present and the config matches).
+/// Returns how many archetypes were restored.
+fn read_checkpoint(cfg: &BalancedLinesConfig, aggs: &[ArchAgg]) -> usize {
+    let content = match std::fs::read_to_string(checkpoint_path(cfg)) {
+        Ok(c) => c,
+        Err(_) => return 0, // no checkpoint -> fresh run
+    };
+    let mut lines = content.lines();
+    if lines.next() != Some(&format!("sig {}", config_sig(cfg))[..]) {
+        eprintln!("balancedlines: existing checkpoint has a different config -> ignoring it (fresh run).");
+        return 0;
+    }
+    let mut loaded = 0;
+    for line in lines {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        if p.len() != 7 {
+            continue;
+        }
+        let i: usize = match p[0].parse() {
+            Ok(v) if v < aggs.len() => v,
+            _ => continue,
+        };
+        if p[1] != "1" {
+            continue; // only restore completed archetypes
+        }
+        aggs[i].load_checkpoint(
+            p[2] == "1",
+            p[3].parse().unwrap_or(0),
+            p[4].parse().unwrap_or(0),
+            p[5].parse().unwrap_or(0),
+            p[6].parse().unwrap_or(0),
+        );
+        loaded += 1;
+    }
+    loaded
+}
+
+/// Persist the current results (JSON) and the resume checkpoint. Called at each archetype boundary
+/// (workers idle), so an interrupted run keeps every archetype finished so far.
+fn save_all(cfg: &BalancedLinesConfig, b: Bounds, aggs: &[ArchAgg]) {
+    if let Err(e) = write_json(cfg, b, aggs) {
+        eprintln!("balancedlines: WARNING failed to write results JSON: {e}");
+    }
+    if let Err(e) = write_checkpoint(cfg, aggs) {
+        eprintln!("balancedlines: WARNING failed to write checkpoint: {e}");
+    }
 }
 
 /// Grand total of the "primary" metric for the end-of-run summary: the intersection count under
@@ -836,6 +982,16 @@ pub fn run(cfg: BalancedLinesConfig) -> io::Result<()> {
     );
     eprintln!("balancedlines: counting DISTINCT end-state positions (D4 symmetry-collapsed).");
     eprintln!("balancedlines: evals are TT-isolated -> results are deterministic (same across runs/threads).");
+
+    // Resume: restore any completed archetypes from a matching checkpoint next to the output file.
+    let resumed = read_checkpoint(&cfg, &aggs);
+    if resumed > 0 {
+        eprintln!(
+            "balancedlines: RESUMING — {resumed} archetype(s) already done (from {}); computing the rest.",
+            checkpoint_path(&cfg)
+        );
+    }
+
     if cfg.depth >= 10 {
         eprintln!(
             "balancedlines: NOTE depth {} means each position is a full fixed-depth search (seconds \
