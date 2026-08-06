@@ -2,10 +2,11 @@
 // PID + a rolling log buffer, and stops it by killing the whole process tree (taskkill /T) so the
 // grandchild topaz.exe can't be orphaned by run-gembot.ps1's restart loop.
 import { spawn, ChildProcess } from "node:child_process";
-import { AppConfig, BotConfig } from "../config/schema.js";
+import { AppConfig, BotConfig, GlobalConfig } from "../config/schema.js";
 import { buildGembotArgs } from "./args.js";
 import { REPO_ROOT, RUN_GEMBOT } from "./paths.js";
-import { recordGame } from "./games.js";
+import { insertGame } from "../db/games.js";
+import { configSnapshot, configHash, type ConfigSnapshot } from "../config/hash.js";
 import { loadConfig } from "../config/store.js";
 
 // Large enough to hold a full game's per-move selection logs (~15-20 lines/move) without dropping
@@ -26,9 +27,18 @@ interface Managed {
   opponent: string | null; // the other player in the current game
   gameId: string | null;
   gameColor: string | null; // the bot's color this game (for W/L/D)
+  gameSize: number | null; // board size reported on the Game Start line
   gameStartedAt: number | null; // when the current game began
   gameLines: string[]; // captured output for the current game (persisted on Game# Over)
   restartQueued: boolean; // a restart was requested mid-game → auto-restart when this game ends
+  // The configuration this process was LAUNCHED with — not whatever's in the config file now. A
+  // running bot keeps playing its launch config until it's restarted, so this is what every game
+  // it finishes gets stamped with.
+  launchConfig: ConfigSnapshot;
+  launchHash: string;
+  serverHost: string;
+  serverPort: number;
+  rated: boolean;
 }
 
 export type BotState = "running" | "exited" | "notRunning";
@@ -93,6 +103,8 @@ function trackGameState(m: Managed, line: string): void {
       // The bot's own account is one of the two; the opponent is the other (case-insensitive match).
       m.opponent = white.toLowerCase() === m.name.toLowerCase() ? black : white;
       m.gameColor = (t[6] ?? "").toLowerCase() || null; // "white" | "black"
+      const size = Number(t[7]);
+      m.gameSize = Number.isInteger(size) ? size : null;
       m.inGame = true;
       m.gameStartedAt = Date.now();
       m.gameLines = [line];
@@ -101,24 +113,40 @@ function trackGameState(m: Managed, line: string): void {
   }
   if (!m.inGame) return;
   if (m.gameLines.length < MAX_GAME_LINES) m.gameLines.push(line);
-  // "Game#<id> Over <result>" ends the game → persist it, then reset the per-game state.
-  if (trimmed.startsWith("Game#") && /^Game#\S+\s+Over\b/.test(trimmed)) {
-    const result = trimmed.split(/\s+/)[2] ?? "";
-    void recordGame(
-      m.name,
-      {
-        opponent: m.opponent,
-        color: m.gameColor,
-        result,
-        startedAt: m.gameStartedAt ?? Date.now(),
-        endedAt: Date.now(),
-      },
-      m.gameLines
-    ).catch((e) => console.error(`[bot-manager] failed to save game for ${m.name}:`, e));
+  // A game ends one of two ways → persist it, then reset the per-game state. "Game#<id> Over
+  // <result>" is the normal finish; "Game#<id> Abandoned. <user> quit" is what the server sends
+  // when the opponent disconnects for good, and it comes INSTEAD of an Over line — miss it and the
+  // bot shows as in-game forever (and mid-game restarts stay queued for a game that can't end).
+  const over = /^Game#\S+\s+(?:Over\s+(\S+)|Abandoned)\b/.exec(trimmed);
+  if (over) {
+    const result = over[1] ?? "Abandoned";
+    try {
+      insertGame(
+        {
+          botName: m.name,
+          playtakGameId: m.gameId,
+          opponent: m.opponent,
+          color: m.gameColor,
+          result,
+          startedAt: m.gameStartedAt ?? Date.now(),
+          endedAt: Date.now(),
+          boardSize: m.gameSize,
+          serverHost: m.serverHost,
+          serverPort: m.serverPort,
+          rated: m.rated,
+          configHash: m.launchHash,
+          config: m.launchConfig,
+        },
+        m.gameLines
+      );
+    } catch (e) {
+      console.error(`[bot-manager] failed to save game for ${m.name}:`, e);
+    }
     m.inGame = false;
     m.opponent = null;
     m.gameId = null;
     m.gameColor = null;
+    m.gameSize = null;
     m.gameStartedAt = null;
     m.gameLines = [];
     // A restart requested mid-game fires now that the game is over (fresh process, current config).
@@ -132,7 +160,7 @@ function trackGameState(m: Managed, line: string): void {
 }
 
 // Spawn one bot. Caller ensures it isn't already running.
-function startBot(bot: BotConfig, global: AppConfig["global"]): StartResult {
+function startBot(bot: BotConfig, global: GlobalConfig): StartResult {
   const args = [
     "-NoProfile",
     "-ExecutionPolicy",
@@ -149,6 +177,7 @@ function startBot(bot: BotConfig, global: AppConfig["global"]): StartResult {
     return { name: bot.name, result: "error", message: (e as Error).message };
   }
 
+  const snapshot = configSnapshot(bot);
   const m: Managed = {
     name: bot.name,
     pid: child.pid,
@@ -162,9 +191,15 @@ function startBot(bot: BotConfig, global: AppConfig["global"]): StartResult {
     opponent: null,
     gameId: null,
     gameColor: null,
+    gameSize: null,
     gameStartedAt: null,
     gameLines: [],
     restartQueued: false,
+    launchConfig: snapshot,
+    launchHash: configHash(snapshot),
+    serverHost: global.serverHost,
+    serverPort: global.port,
+    rated: global.rated,
   };
   managed.set(bot.name, m);
 
@@ -184,6 +219,7 @@ function startBot(bot: BotConfig, global: AppConfig["global"]): StartResult {
     m.opponent = null;
     m.gameId = null;
     m.gameColor = null;
+    m.gameSize = null;
     m.gameStartedAt = null;
     m.gameLines = [];
     m.restartQueued = false; // the process is gone; nothing to restart-after-game

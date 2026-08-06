@@ -1,5 +1,12 @@
 // Thin fetch wrappers for the backend API (same-origin via the Vite /api proxy).
-import type { AppConfig, ConfigSchema, GameSummary, StatusResponse } from "./types";
+import type {
+  AppConfig,
+  ConfigSchema,
+  EloStats,
+  GameDetail,
+  GameSummary,
+  StatusResponse,
+} from "./types";
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
@@ -43,10 +50,13 @@ export const api = {
   stopOrphans: () => sendJson<{ killed: number[] }>("POST", "/api/bots/orphans/stop", {}),
   getLogs: (name: string, tail = 200) =>
     getJson<{ name: string; lines: string[] }>(`/api/bots/${name}/logs?tail=${tail}`),
-  getGames: (name: string) =>
-    getJson<{ name: string; games: GameSummary[] }>(`/api/bots/${name}/games`),
-  getGameLog: (name: string, id: string) =>
-    getJson<{ name: string; id: string; lines: string[] }>(
-      `/api/bots/${name}/games/${encodeURIComponent(id)}`
-    ),
+  // Per-bot history, newest first. The database keeps every game; the UI only asks for a window.
+  getGames: (name: string, limit = 30) =>
+    getJson<{ name: string; games: GameSummary[] }>(`/api/bots/${name}/games?limit=${limit}`),
+  // Combined newest-first history across all bots (one request instead of one per bot).
+  getAllGames: (limit = 50) => getJson<{ games: GameSummary[] }>(`/api/bots/games?limit=${limit}`),
+  getGame: (name: string, id: string) =>
+    getJson<GameDetail>(`/api/bots/${name}/games/${encodeURIComponent(id)}`),
+  // Opponent ELOs won/lost against, restricted to the bot's current saved configuration.
+  getEloStats: (name: string) => getJson<EloStats>(`/api/bots/${name}/elo-stats`),
 };

@@ -20,5 +20,7 @@ bot-manager-app/**/node_modules/
 bot-manager-app/**/dist/
 bot-manager-app/bot-manager-config.json
 bot-manager-app/game-logs/
+# Fallback location for the game database when D: isn't available (see server/src/db/paths.ts).
+bot-manager-app/data/
 # Loose saved game logs contain a real bot-account password in a debug config dump - keep out.
 bot-manager-app/*-game.json

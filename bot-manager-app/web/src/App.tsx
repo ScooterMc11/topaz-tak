@@ -82,6 +82,9 @@ export default function App() {
   const [statuses, setStatuses] = useState<Record<string, BotStatus>>({});
   const [orphans, setOrphans] = useState<OrphanHost[]>([]);
   const [logsTarget, setLogsTarget] = useState<LogsTarget | null>(null);
+  // Bumped on every successful save. The Logs drawer's ELO box plots match on the bot's saved
+  // configuration, so they need to re-query the moment that configuration changes.
+  const [configVersion, setConfigVersion] = useState(0);
   // Client-observed game start times, keyed by `${botName}:${gameId}` and persisted to localStorage
   // so the in-game duration survives page reloads (the backend doesn't track a game-start timestamp).
   const [gameStartTimes, setGameStartTimes] = useState<Record<string, number>>(() => {
@@ -153,9 +156,6 @@ export default function App() {
     () => !!draft && !!baseline && JSON.stringify(draft) !== JSON.stringify(baseline),
     [draft, baseline]
   );
-
-  // Stable roster for the combined History card (avoids restarting its fetch loop each render).
-  const botNames = useMemo(() => draft?.bots.map((b) => b.name) ?? [], [draft]);
 
   // Rough RAM budget: sum the hash tables of enabled bots (the one config knob that reserves memory).
   // The search working set adds more, so warn well below physical RAM. hashMb default is 48.
@@ -230,6 +230,7 @@ export default function App() {
       const saved = await api.putConfig(draft);
       setBaseline(saved);
       setDraft(structuredClone(saved));
+      setConfigVersion((v) => v + 1);
       setToast({ msg: "Config saved", severity: "success" });
     } catch (e) {
       setToast({ msg: `Save failed — ${(e as Error).message}`, severity: "error" });
@@ -441,14 +442,17 @@ export default function App() {
               );
             })}
             <HistoryCard
-              botNames={botNames}
               onOpenGame={(name, gameId) => setLogsTarget({ name, tab: "history", gameId })}
             />
           </>
         )}
       </Container>
 
-      <LogsDrawer target={logsTarget} onClose={() => setLogsTarget(null)} />
+      <LogsDrawer
+        target={logsTarget}
+        onClose={() => setLogsTarget(null)}
+        configVersion={configVersion}
+      />
 
       <Snackbar
         open={!!toast}
