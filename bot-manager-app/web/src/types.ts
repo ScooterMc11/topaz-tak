@@ -118,14 +118,48 @@ export interface StatusResponse {
 
 export interface GameSummary {
   id: string;
+  botName: string;
+  playtakGameId: string | null;
   opponent: string | null;
+  opponentRating: number | null;
+  botRating: number | null;
   color: string | null;
-  result: string;
+  result: string; // raw PlayTak token, e.g. "0-F", "R-0", "1/2-1/2"
   outcome: "win" | "loss" | "draw" | "unknown";
   startedAt: number;
   endedAt: number;
   moveCount: number;
-  file: string;
+  boardSize: number | null;
+  rated: boolean | null;
+  ratingsState: "pending" | "ok" | "unavailable";
+  reviewUrl: string | null; // PTN Ninja deep link, null for games on a non-public server
+}
+
+// The configuration a bot was running for one particular game (mirrors the server's ConfigSnapshot).
+export interface ConfigSnapshot {
+  size: BotSize;
+  tunables: BotTunables;
+  advanced: BotAdvanced;
+}
+
+export interface GameDetail extends GameSummary {
+  config: ConfigSnapshot | null;
+  configHash: string;
+  serverHost: string | null;
+  lines: string[];
+}
+
+// Opponent-ELO distributions for a bot's *current* configuration. `won`/`lost` are ascending
+// opponent ratings; a config that's never been played returns both empty.
+export interface EloStats {
+  name: string;
+  config: ConfigSnapshot;
+  configHash: string;
+  won: number[];
+  lost: number[];
+  matchedGames: number;
+  totalGames: number;
+  pendingRatings: number;
 }
 
 export const LEVEL_ORDER: BotLevel[] = ["Advanced", "Intermediate", "Novice"];

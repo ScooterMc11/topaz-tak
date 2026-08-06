@@ -1,6 +1,6 @@
 // Combined game history across all bots. Full-width, collapsible (expanded by default) card at the
-// bottom of the page. Merges every bot's saved games (the existing per-bot /games endpoint) into one
-// newest-first list. Clicking a row opens that bot's Logs drawer on the History tab with the game open.
+// bottom of the page. One newest-first list straight out of the game database.
+// Clicking a row opens that bot's Logs drawer on the History tab with the game open.
 //   • Desktop (sm+): a real table.
 //   • Phone (xs):    stacked cards, no horizontal scrolling.
 import { useEffect, useMemo, useState } from "react";
@@ -27,16 +27,12 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import { api } from "../api";
 import type { GameSummary } from "../types";
-import { fmtDateTime, fmtDuration, OUTCOME_COLOR } from "../format";
-
-// A game plus which bot played it (the combined list's extra dimension).
-type HistoryRow = GameSummary & { botName: string };
+import { fmtDateTime, fmtDuration, fmtResult, OUTCOME_COLOR } from "../format";
 
 const MAX_ROWS = 50;
 const REFRESH_MS = 15000;
 
 interface HistoryCardProps {
-  botNames: string[];
   onOpenGame: (botName: string, gameId: string) => void;
 }
 
@@ -45,44 +41,30 @@ function OutcomeChip({ g }: { g: GameSummary }) {
     <Chip
       size="small"
       color={OUTCOME_COLOR[g.outcome]}
-      label={g.outcome === "unknown" ? g.result || "?" : g.outcome}
+      label={g.outcome === "unknown" ? "?" : g.outcome}
       sx={{ height: 18, fontSize: 10, textTransform: "capitalize" }}
     />
   );
 }
 
-export default function HistoryCard({ botNames, onOpenGame }: HistoryCardProps) {
+export default function HistoryCard({ onOpenGame }: HistoryCardProps) {
   const theme = useTheme();
   const stacked = useMediaQuery(theme.breakpoints.down("sm")); // phones: cards instead of a table
   const [collapsed, setCollapsed] = useState(false); // expanded by default
-  const [rows, setRows] = useState<HistoryRow[] | null>(null);
+  const [rows, setRows] = useState<GameSummary[] | null>(null);
 
-  // Stable key so the fetch effect doesn't restart on every parent render (botNames is rebuilt each time).
-  const namesKey = botNames.join(",");
-
-  // Fetch every bot's games in parallel, merge newest-first, cap the list. Poll while expanded so a
-  // freshly-finished game shows up; skip the work entirely while collapsed.
+  // The database already returns the merged, newest-first list, so this is one request. Poll while
+  // expanded so a freshly-finished game shows up; skip the work entirely while collapsed.
   useEffect(() => {
     if (collapsed) return;
-    const names = namesKey ? namesKey.split(",") : [];
     let cancelled = false;
     async function load() {
-      const results = await Promise.all(
-        names.map(async (name) => {
-          try {
-            const { games } = await api.getGames(name);
-            return games.map((g) => ({ ...g, botName: name }));
-          } catch {
-            return [] as HistoryRow[];
-          }
-        })
-      );
-      if (cancelled) return;
-      const merged = results
-        .flat()
-        .sort((a, b) => b.startedAt - a.startedAt)
-        .slice(0, MAX_ROWS);
-      setRows(merged);
+      try {
+        const { games } = await api.getAllGames(MAX_ROWS);
+        if (!cancelled) setRows(games);
+      } catch {
+        if (!cancelled) setRows([]);
+      }
     }
     load();
     const id = setInterval(load, REFRESH_MS);
@@ -90,7 +72,7 @@ export default function HistoryCard({ botNames, onOpenGame }: HistoryCardProps) 
       cancelled = true;
       clearInterval(id);
     };
-  }, [collapsed, namesKey]);
+  }, [collapsed]);
 
   const body = useMemo(() => {
     if (rows === null) {
@@ -121,7 +103,15 @@ export default function HistoryCard({ botNames, onOpenGame }: HistoryCardProps) 
                 <Typography variant="body2" noWrap sx={{ fontWeight: 600 }}>
                   {g.botName} <Box component="span" sx={{ fontWeight: 400, color: "text.secondary" }}>vs {g.opponent ?? "unknown"}</Box>
                 </Typography>
-                <OutcomeChip g={g} />
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexShrink: 0 }}>
+                  <Typography
+                    variant="caption"
+                    sx={{ fontFamily: "ui-monospace, monospace", color: "text.secondary" }}
+                  >
+                    {fmtResult(g.result)}
+                  </Typography>
+                  <OutcomeChip g={g} />
+                </Box>
               </Box>
               <Typography variant="caption" color="text.secondary">
                 {fmtDateTime(g.startedAt)} · {fmtDuration(g.startedAt, g.endedAt)} · {g.moveCount} moves
@@ -155,7 +145,22 @@ export default function HistoryCard({ botNames, onOpenGame }: HistoryCardProps) 
               >
                 <TableCell sx={{ fontWeight: 600 }}>{g.botName}</TableCell>
                 <TableCell>vs {g.opponent ?? "unknown"}</TableCell>
-                <TableCell><OutcomeChip g={g} /></TableCell>
+                <TableCell>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                    <Box
+                      component="span"
+                      sx={{
+                        fontFamily: "ui-monospace, monospace",
+                        fontSize: 12,
+                        color: "text.secondary",
+                        minWidth: 32,
+                      }}
+                    >
+                      {fmtResult(g.result)}
+                    </Box>
+                    <OutcomeChip g={g} />
+                  </Box>
+                </TableCell>
                 <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtDateTime(g.startedAt)}</TableCell>
                 <TableCell align="right" sx={{ whiteSpace: "nowrap" }}>{fmtDuration(g.startedAt, g.endedAt)}</TableCell>
                 <TableCell align="right">{g.moveCount}</TableCell>

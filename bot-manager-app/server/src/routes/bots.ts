@@ -16,7 +16,8 @@ import {
   forceKill,
 } from "../bots/manager.js";
 import { scanSystem } from "../bots/scan.js";
-import { listGames, readGameLog } from "../bots/games.js";
+import { listGames, listAllGames, getGame, getGameText, eloStats } from "../db/games.js";
+import { hashOf, configSnapshot } from "../config/hash.js";
 
 export const botsRouter = Router();
 
@@ -148,20 +149,67 @@ botsRouter.get("/:name/logs", (req, res) => {
   res.json({ name: req.params.name, lines: getLogs(req.params.name, tail) });
 });
 
-// Saved game history (last 20 per bot).
-botsRouter.get("/:name/games", async (req, res, next) => {
+// How many games the UI is allowed to pull at once. The database keeps everything; these caps just
+// stop a stray ?limit=999999 from serializing the entire history into one response.
+const MAX_LIMIT = 500;
+const clampLimit = (raw: unknown, fallback: number) => {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), MAX_LIMIT) : fallback;
+};
+
+// Combined newest-first history across every bot (the History card). Registered before the
+// /:name/* routes so "games" can't be read as a bot name.
+botsRouter.get("/games", (req, res, next) => {
   try {
-    res.json({ name: req.params.name, games: await listGames(req.params.name) });
+    res.json({ games: listAllGames(clampLimit(req.query.limit, 50)) });
   } catch (e) {
     next(e);
   }
 });
 
-botsRouter.get("/:name/games/:id", async (req, res, next) => {
+// Saved game history for one bot, newest first. The UI asks for 30; the database keeps them all.
+botsRouter.get("/:name/games", (req, res, next) => {
   try {
-    const lines = await readGameLog(req.params.name, req.params.id);
-    if (lines == null) return res.status(404).json({ error: "game not found" });
-    res.json({ name: req.params.name, id: req.params.id, lines });
+    res.json({
+      name: req.params.name,
+      games: listGames(req.params.name, clampLimit(req.query.limit, 30)),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Opponent-ELO distributions for the bot's CURRENT saved configuration. A config the bot has never
+// played under simply returns empty arrays — that's the intended "reset" when tunables change.
+botsRouter.get("/:name/elo-stats", async (req, res, next) => {
+  try {
+    const config = await loadConfig();
+    const bot = config.bots.find((b) => b.name === req.params.name);
+    if (!bot) return res.status(404).json({ error: "unknown bot" });
+    res.json({ name: bot.name, config: configSnapshot(bot), ...eloStats(bot.name, hashOf(bot)) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// The saved log as plain text, so a game is still shareable as a file now that logs live in the
+// database rather than beside it on disk.
+botsRouter.get("/:name/games/:id/log.txt", (req, res, next) => {
+  try {
+    const text = getGameText(req.params.name, req.params.id);
+    if (text == null) return res.status(404).json({ error: "game not found" });
+    res.type("text/plain").send(text);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// One game: its log plus the configuration the bot was running at the time and a review link.
+botsRouter.get("/:name/games/:id", (req, res, next) => {
+  try {
+    const game = getGame(req.params.name, req.params.id);
+    if (!game) return res.status(404).json({ error: "game not found" });
+    res.json(game);
   } catch (e) {
     next(e);
   }
