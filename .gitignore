@@ -1,4 +1,6 @@
 /target
+# Alternate cargo target dirs used for side-by-side builds (--target-dir).
+/target-*
 *.csv
 *.svg
 perf.*

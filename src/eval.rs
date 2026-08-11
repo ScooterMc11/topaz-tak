@@ -24,6 +24,16 @@ pub const LOSE_SCORE: Eval = -1 * WIN_SCORE;
 pub const WIN_FOUND: Eval = WIN_SCORE - 100;
 pub const LOSS_FOUND: Eval = LOSE_SCORE + 100;
 
+/// Is this an evaluation, as opposed to one of the search's sentinel alpha/beta seeds?
+///
+/// Real scores never leave `[LOSE_SCORE, WIN_SCORE]` — a win is `WIN_SCORE` minus the distance to
+/// it — while the window seeds sit two orders of magnitude outside that. A search that finds no move
+/// returns its seed unchanged, and letting one of those reach a caller means a GUI eval bar reading
+/// `-1000000` as a total loss, or a "runner-up" reported a quarter of a million cp behind.
+pub fn is_real_score(score: Eval) -> bool {
+    score.abs() <= WIN_SCORE + 200
+}
+
 pub trait Evaluator {
     type Game: TakBoard + Send;
     fn evaluate(&mut self, game: &Self::Game, depth: usize) -> Eval;

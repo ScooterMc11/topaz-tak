@@ -3,7 +3,7 @@ use std::result;
 use super::{Color, GameResult};
 use crate::board::TakBoard;
 use crate::eval::{Evaluator, LOSS_FOUND, WIN_FOUND};
-use crate::eval::{LOSE_SCORE, WIN_SCORE};
+use crate::eval::{is_real_score, LOSE_SCORE, WIN_SCORE};
 use crate::move_gen::{GameMove, MoveBuffer, RevGameMove, ScoredMove, SmartMoveBuffer};
 use crate::transposition_table::{HashEntry, ScoreCutoff};
 use crate::{Bitboard, TeiCommand};
@@ -185,9 +185,33 @@ where
                 }
                 break 'outer;
             }
-            if let Some(&root_move) = pv_moves.first() {
-                depth_choices.push((root_move, best_score));
+            // Did this PV index actually produce a result?
+            //
+            // Two ways it can look like it did without having done so. The PV table is not cleared
+            // between indices, so an index that finds nothing leaves the *previous* index's line in
+            // place — the emptiness check below passes on a move already reported. And a root search
+            // where no move improves alpha returns the window seed rather than an evaluation. Taken
+            // together those put `multipv 2 score cp -1000000 pv <the PV-1 move>` on the wire, which
+            // a GUI reads as the side to move being completely lost, and push a duplicate root move
+            // carrying a sentinel score into `root_choices`.
+            let usable = match pv_moves.first() {
+                Some(&root_move) => {
+                    is_real_score(best_score)
+                        && !depth_choices.iter().any(|&(seen, _)| seen == root_move)
+                }
+                None => false,
+            };
+            if !usable {
+                // Nothing at all at this depth (a finished position, say) means the whole iteration
+                // is void and `outcome` must keep whatever the last real depth found. Otherwise it
+                // just means there is no further distinct root move to enumerate.
+                if pv_idx == 0 {
+                    break 'outer;
+                }
+                break;
             }
+            let pv_root = pv_moves[0];
+            depth_choices.push((pv_root, best_score));
             if pv_idx == 0 {
                 outcome = Some(SearchOutcome::new(
                     best_score,
@@ -197,10 +221,6 @@ where
                 ));
             }
             if is_multi_pv {
-                // No PV move at this index means there is no further distinct root move to find —
-                // the position has fewer legal moves than the requested PV count, or this PV search
-                // returned nothing. Stop enumerating rather than indexing an empty PV.
-                let Some(&pv_root) = pv_moves.first() else { break };
                 outcomes.push(SearchOutcome::new(
                     best_score,
                     pv_moves.clone(),
@@ -209,30 +229,36 @@ where
                 ));
                 info.forbidden_root_moves.try_append(pv_root);
             }
-            if !info.quiet {
-                if is_multi_pv && pv_idx == num_pvs - 1 {
-                    for idx in 0..num_pvs {
-                        if let Some(res) = outcomes.get_mut(idx) {
-                            res.update_multipv_index(idx + 1);
-                        }
-                    }
-                    if let Some((last_pv, result)) = outcomes.split_last_mut() {
-                        for res in result {
-                            res.update_multipv(last_pv);
-                        }
-                    }
-                    for line in outcomes.drain(..) {
-                        println!("{}", line);
-                    }
-                } else {
-                    if let Some(ref outcome) = outcome {
-                        println!("{}", outcome);
-                    }
+            // Single-PV reports as it goes. Multi-PV reports the whole depth in one numbered block
+            // once its PVs are in — see just below the loop — so an untagged copy of PV 1 is not
+            // interleaved with the tagged lines.
+            if !is_multi_pv && !info.quiet {
+                if let Some(ref outcome) = outcome {
+                    println!("{}", outcome);
                 }
             }
             // Stop wasting time
             if best_score > WIN_SCORE - 10 || best_score < LOSE_SCORE + 10 {
                 solved[pv_idx] = true;
+            }
+        }
+        // The depth's multi-PV block. Emitted here rather than on the last PV index because the loop
+        // above stops early when the position has fewer distinct root moves than PVs were asked for,
+        // and the lines it did find still have to be reported. Draining unconditionally also keeps
+        // `outcomes` from carrying this depth's lines into the next one on a quiet search.
+        if is_multi_pv {
+            for (idx, res) in outcomes.iter_mut().enumerate() {
+                res.update_multipv_index(idx + 1);
+            }
+            if let Some((last_pv, rest)) = outcomes.split_last_mut() {
+                for res in rest {
+                    res.update_multipv(last_pv);
+                }
+            }
+            for line in outcomes.drain(..) {
+                if !info.quiet {
+                    println!("{}", line);
+                }
             }
         }
         // This depth completed fully: record its top root moves+scores so a caller can sample
@@ -668,8 +694,14 @@ where
     let mut has_win = false;
     if board.ply() >= 6 {
         if let Some(mv) = board.can_make_road(&mut info.extra_move_buffer, None) {
-            has_win = true;
-            moves.add_scored(mv, 10000);
+            // A win in 1 is the whole move list: nothing else needs generating or searching. The
+            // exception is a root asked to enumerate its alternatives (`full_root_moves`) — there
+            // the one move the shortcut leaves behind is exactly what multi-PV cannot look past,
+            // so the root falls through to normal generation and finds the win that way instead.
+            if !(is_root && info.full_root_moves) {
+                has_win = true;
+                moves.add_scored(mv, 10000);
+            }
         }
     }
     info.extra_move_buffer.clear();
