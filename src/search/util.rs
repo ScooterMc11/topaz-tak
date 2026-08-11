@@ -49,6 +49,9 @@ pub struct SearchInfo<'a> {
     pub(crate) main_thread: bool,
     pub(crate) multi_pv: usize,
     pub(crate) forbidden_root_moves: SimpleMoveList<GameMove>,
+    /// Generate the root's moves in full even when a road-in-1 is available, instead of stopping at
+    /// the win. See `full_root_moves`.
+    pub(crate) full_root_moves: bool,
     /// The deepest fully-completed iteration's root moves with their scores, best first (up to
     /// `multi_pv` entries). Lets a caller weaken the engine by sampling among the top moves instead
     /// of always taking the best (see `select_softmax`). Empty until the first depth completes.
@@ -91,6 +94,7 @@ impl<'a> SearchInfo<'a> {
             main_thread: true,
             multi_pv: 1,
             forbidden_root_moves: SimpleMoveList::new(),
+            full_root_moves: false,
             root_choices: Vec::new(),
             depth_scores: Vec::new(),
             progress: None,
@@ -109,6 +113,17 @@ impl<'a> SearchInfo<'a> {
     /// Per-depth `(depth, best_score)` for every fully-completed iteration (see field docs).
     pub fn depth_scores(&self) -> &[(usize, i32)] {
         &self.depth_scores
+    }
+    /// Make the root generate every move even when a road-in-1 is on the board.
+    ///
+    /// Normally finding one is the end of move generation there — nothing beats winning, so the
+    /// search plays it and stops. That shortcut leaves the root holding a **single** move, which a
+    /// multi-PV search cannot enumerate past: excluding the winner for PV 2 empties the move list
+    /// and the search comes back with nothing. A caller that wants the *alternatives to* a winning
+    /// move, rather than the win itself, turns this on and pays for the generation.
+    pub fn full_root_moves(mut self, on: bool) -> Self {
+        self.full_root_moves = on;
+        self
     }
     pub fn set_multi_pv(mut self, num_pvs: usize) -> Self {
         // Clamp to [1, MAX_MULTI_PV]: the search's per-PV working arrays are fixed at MAX_MULTI_PV,

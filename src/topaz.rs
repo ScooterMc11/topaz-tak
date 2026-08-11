@@ -227,7 +227,18 @@ pub fn main() {
             opts.optopt("s", "size", "Board size: 4, 5 or 6 (default 6)", "N");
             opts.optopt("k", "halfkomi", "Half-komi; 2 komi == 4 (default 0)", "N");
             opts.optopt("n", "nodes", "Node budget per position (default 100000)", "N");
-            opts.optopt("p", "plies", "Whitespace- or comma-separated plies", "PTN");
+            opts.optopt(
+                "t",
+                "tps",
+                "Start from this position instead of the empty board; size is inferred from it",
+                "TPS",
+            );
+            opts.optopt(
+                "p",
+                "plies",
+                "Whitespace- or comma-separated plies; `best` plays the engine's own choice",
+                "PTN",
+            );
             opts.optopt("f", "file", "Read plies from a PTN file", "PATH");
             opts.optopt("o", "output", "JSON output path (default stdout)", "PATH");
             opts.optopt(
@@ -235,6 +246,25 @@ pub fn main() {
                 "grading",
                 "Loss measurement: aligned (default, 1 search/ply), sibling (2), both",
                 "MODE",
+            );
+            opts.optopt(
+                "",
+                "alts",
+                "Also report the position's N best root moves per ply, with their grading numbers \
+                 (0 = off, capped at 16). Costs one extra search on each ply the gates below admit",
+                "N",
+            );
+            opts.optopt(
+                "",
+                "alts-min-win-prob",
+                "Gate --alts to plies where the mover's win probability going in is at least this",
+                "P",
+            );
+            opts.optopt(
+                "",
+                "alts-max-loss",
+                "Gate --alts to plies that gave up at most this many win percentage points",
+                "PCT",
             );
             opts.optflag("q", "quiet", "Suppress per-ply progress on stderr");
             opts.optflag("h", "help", "Print this help menu");
@@ -272,14 +302,31 @@ pub fn main() {
                 },
                 None => default.grading,
             };
+            let tps = matches.opt_str("t");
+            // A TPS names its own board size, so `-s` is only needed without one.
+            let size = match (matches.opt_str("s"), &tps) {
+                (Some(text), _) => text.trim().parse().expect("--size must be 4, 5 or 6"),
+                (None, Some(tps)) => tps.split_whitespace().next().map_or(default.size, |rows| {
+                    rows.split('/').count()
+                }),
+                (None, None) => default.size,
+            };
             let cfg = topaz_tak::analyze_game::AnalyzeGameConfig {
-                size: matches.opt_get_default("s", default.size).unwrap(),
+                size,
                 half_komi: matches.opt_get_default("k", default.half_komi).unwrap(),
                 nodes: matches.opt_get_default("n", default.nodes).unwrap(),
+                tps,
                 plies,
                 output: matches.opt_str("o"),
                 quiet: matches.opt_present("q"),
                 grading,
+                alts: matches.opt_get_default("alts", default.alts).unwrap(),
+                alts_min_win_prob: matches
+                    .opt_get_default("alts-min-win-prob", default.alts_min_win_prob)
+                    .unwrap(),
+                alts_max_loss_pct: matches
+                    .opt_get_default("alts-max-loss", default.alts_max_loss_pct)
+                    .unwrap(),
             };
             if let Err(e) = topaz_tak::analyze_game::run(cfg) {
                 eprintln!("analyzegame: {e}");
@@ -1336,6 +1383,19 @@ fn play_game_tei<E: Evaluator + Default + Send>(
         let message = receiver.recv()?;
         match message {
             TeiCommand::Go(go) => {
+                // A GUI stepping through a game will land on the final position and ask for a move
+                // there. Say so plainly instead of running a search that can only come back empty.
+                if let Some(result) = board.game_result() {
+                    println!(
+                        "info string game is already over ({}); no move to make",
+                        match result {
+                            GameResult::WhiteWin => "white wins",
+                            GameResult::BlackWin => "black wins",
+                            GameResult::Draw => "draw",
+                        }
+                    );
+                    continue;
+                }
                 let mut info = if let Some(max_depth) = go.depth {
                     SearchInfo::new(max_depth, &table)
                 } else {
@@ -1389,9 +1449,13 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                     init.num_threads,
                 );
                 // let res = topaz_tak::search::search(&mut board, &mut eval, &mut info);
-                if let Some(outcome) = res {
+                // A position with no move to make — a finished game — is a thing a GUI will ask
+                // about while stepping through a game. Answer it rather than panicking: the panic
+                // killed this worker thread, and every later `go` on the connection then went
+                // unanswered while the process stayed up looking healthy.
+                let best_move = res.as_ref().and_then(|o| o.best_move());
+                if let (Some(outcome), Some(best)) = (res.as_ref(), best_move) {
                     println!("{}", outcome);
-                    let best = outcome.best_move().expect("Could not find best move!");
                     // Weakening knobs in precedence order: dynamic eval-gap -> static eval-gap ->
                     // temperature; none set => the best move.
                     let chosen = if init.eval_gap_std > 0 {
@@ -1427,8 +1491,10 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                         best
                     };
                     println!("bestmove {}", chosen.trim_end_matches('*'));
+                } else if res.is_some() {
+                    println!("info string no legal move in this position (game already decided)");
                 } else {
-                    println!("Something went wrong, search failed!");
+                    println!("info string search failed to return a result");
                 }
             }
             TeiCommand::Position(s) => {
