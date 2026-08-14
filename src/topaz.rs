@@ -256,8 +256,9 @@ pub fn main() {
             );
             opts.optopt(
                 "",
-                "alts-min-win-prob",
-                "Gate --alts to plies where the mover's win probability going in is at least this",
+                "alts-min-decided",
+                "Gate --alts to plies played from a position at least this decided, measured on \
+                 the leader's win probability going in (0.5 even, 1 a proven win, either player)",
                 "P",
             );
             opts.optopt(
@@ -321,8 +322,8 @@ pub fn main() {
                 quiet: matches.opt_present("q"),
                 grading,
                 alts: matches.opt_get_default("alts", default.alts).unwrap(),
-                alts_min_win_prob: matches
-                    .opt_get_default("alts-min-win-prob", default.alts_min_win_prob)
+                alts_min_decided: matches
+                    .opt_get_default("alts-min-decided", default.alts_min_decided)
                     .unwrap(),
                 alts_max_loss_pct: matches
                     .opt_get_default("alts-max-loss", default.alts_max_loss_pct)
