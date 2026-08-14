@@ -123,6 +123,9 @@ where
         }
         info.forbidden_root_moves.clear();
         depth_choices.clear();
+        // Cleared here rather than by draining at the end of the depth, so the lines survive long
+        // enough to be snapshotted alongside `depth_choices` once the depth completes.
+        outcomes.clear();
         let num_pvs = info.multi_pv as usize;
         if solved[0] {
             // The best move is a proven win/loss; deeper search can't change the
@@ -244,8 +247,7 @@ where
         }
         // The depth's multi-PV block. Emitted here rather than on the last PV index because the loop
         // above stops early when the position has fewer distinct root moves than PVs were asked for,
-        // and the lines it did find still have to be reported. Draining unconditionally also keeps
-        // `outcomes` from carrying this depth's lines into the next one on a quiet search.
+        // and the lines it did find still have to be reported.
         if is_multi_pv {
             for (idx, res) in outcomes.iter_mut().enumerate() {
                 res.update_multipv_index(idx + 1);
@@ -255,15 +257,20 @@ where
                     res.update_multipv(last_pv);
                 }
             }
-            for line in outcomes.drain(..) {
-                if !info.quiet {
+            if !info.quiet {
+                for line in outcomes.iter() {
                     println!("{}", line);
                 }
             }
         }
         // This depth completed fully: record its top root moves+scores so a caller can sample
-        // among them (move-selection weakening) instead of always playing the best move.
+        // among them (move-selection weakening) instead of always playing the best move, and the
+        // line behind each, which multi-PV built anyway and used to throw away. Both are taken here
+        // and only here, so they cannot come from different iterations — an aborted final depth
+        // breaks out of `'outer` above without reaching this point and leaves the last full one
+        // standing.
         info.root_choices = depth_choices.clone();
+        info.multi_pv_lines = outcomes.iter().map(|o| o.pv.clone()).collect();
         // Also snapshot the PV score at this completed depth so a caller can read the whole
         // eval-vs-depth curve from one search (see `start_eval`). Only fully-completed depths land
         // here: an aborted final iteration breaks out of `'outer` above before reaching this point.

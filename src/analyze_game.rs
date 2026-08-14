@@ -71,6 +71,15 @@
 //!   - `pv` — the principal variation from the position this ply reached, in short PTN: the engine's
 //!     recommended reply first, then the line it expects. This is the line the ply's own score is
 //!     *about*, which is what makes it the answer to "why that evaluation?".
+//!   - `runner_up` — the second-best move in that same position, `{display, cp_white, pv}`, from
+//!     that same multi-PV 2 search: `pv` is its line on the same terms as the ply's own, and
+//!     `display` is its first move. Every position gets one for free — it is where `sharp_cp` comes
+//!     from, and multi-PV builds a line per index whether or not anyone keeps it — so unlike `alts`
+//!     it is not gated. `null` on a terminal ply and in a position with one move to make.
+//!   - `search_nodes` — how many nodes that search actually spent. `nodes_per_ply` is the *budget*;
+//!     this is the bill, and the two differ whenever the search stopped early — a solved position,
+//!     or an iteration that finished under the cap. `null` on a terminal ply, which is pinned
+//!     rather than searched.
 //!
 //! **How the loss is measured** (`Grading`). Two methods, because the obvious one is wrong:
 //!
@@ -131,10 +140,11 @@
 //! raw grading numbers the played ply does, so the caller can score them on its own tables. See
 //! `Alternatives` for the shape and for what the list can and cannot answer.
 //!
-//! Enumerating them costs one extra search of the position, so it is gated: `--alts-min-win-prob`
+//! Enumerating them costs one extra search of the position, so it is gated: `--alts-min-decided`
 //! and `--alts-max-loss` name the plies worth spending it on. Both are the *caller's* thresholds
 //! handed to the engine — nothing here decides which plies matter, it only avoids searching the ones
-//! the caller has already said it will ignore.
+//! the caller has already said it will ignore. Note that the first is read off the **leader's** win
+//! probability rather than the mover's, so it admits both players' moves out of a settled position.
 
 use crate::board::{Board4, Board5, Board6, Piece, TakBoard};
 use crate::eval::{Evaluator, LOSE_SCORE, NNUE4, NNUE5, NNUE6, WIN_SCORE};
@@ -241,9 +251,15 @@ pub struct AnalyzeGameConfig {
     /// How many root moves to enumerate alongside a ply (see `Alternatives`). 0 turns the whole
     /// thing off, which is the default; the search caps it at `MAX_MULTI_PV`.
     pub alts: usize,
-    /// Only plies where the mover's win probability *going in* is at least this get an alternatives
-    /// list. The caller's threshold, not the engine's — see the module docs.
-    pub alts_min_win_prob: f64,
+    /// Only plies played from a position at least this **decided** get an alternatives list, where
+    /// decidedness is the *leader's* win probability going in — `max(p, 1 - p)`, so 0.5 is dead
+    /// even and 1 is a proven win, whichever player holds it.
+    ///
+    /// Two-sided on purpose: "this game is settled" is a fact about the position, not about who is
+    /// to move in it, and a caller weighing how hard a move was to find wants it for the player
+    /// being ground down as much as for the one doing the grinding. The caller's threshold, not the
+    /// engine's — see the module docs.
+    pub alts_min_decided: f64,
     /// ...and only those that gave up at most this many **win percentage points**, on the same
     /// normalised footing the caller grades on (`loss_cp` against `cp_before`). A ply the loss
     /// method could not grade at all never qualifies.
@@ -262,7 +278,7 @@ impl Default for AnalyzeGameConfig {
             quiet: false,
             grading: Grading::Aligned,
             alts: 0,
-            alts_min_win_prob: 0.0,
+            alts_min_decided: 0.0,
             alts_max_loss_pct: f64::INFINITY,
         }
     }
@@ -387,8 +403,30 @@ struct Alternative {
 struct Alternatives {
     /// The played move's own score in this search, or `None` if it did not make the list.
     played_cp: Option<i32>,
+    /// How many nodes the multi-PV search that produced this list spent. Reported for the same
+    /// reason `search_nodes` is: the budget says what was allowed, this says what was used.
+    nodes: u64,
     /// The other root moves, best first, excluding the played one.
     moves: Vec<Alternative>,
+}
+
+/// The second-best move in the position a ply reached, from that position's own multi-PV 2 search —
+/// the one every position gets. See `Searched::runner_up`.
+///
+/// **Not an `Alternative`**, despite answering a similar question. An `Alternative` comes from the
+/// extra `--alts` search of the position a ply was played *in*, carries the rarity facts, and exists
+/// only on the plies that search was spent on. This is one move out of the search the ply's own `pv`
+/// and `cp_white` come from, so it is on exactly their footing and is there for every ply.
+struct RunnerUp {
+    /// The move in conventional short PTN, spelled against the position it is played in. Always the
+    /// first entry of `pv`, kept separately because the line can come back empty.
+    display: String,
+    /// Its score in **White's frame**, so it sits directly beside the ply's `cp_white` — the two are
+    /// the best and second-best readings of one position from one search.
+    score_white: i32,
+    /// The line behind it, in short PTN, on the same terms as the ply's own `pv` — replayed on the
+    /// board so the spelling and crush flags are right, and truncated at anything unplayable.
+    pv: Vec<String>,
 }
 
 /// One analyzed ply.
@@ -464,11 +502,18 @@ struct PlyAnalysis {
     /// recommended reply first, then the line it expects to follow. Empty for a terminal ply, and
     /// truncated at any move the position cannot actually play (see `pv_ptn`).
     pv: Vec<String>,
+    /// The second-best move in that same position, from that same search. `None` for a terminal
+    /// ply, and for a position with only one move to make.
+    runner_up: Option<RunnerUp>,
     /// Deepest fully-completed iteration of the search of the position this ply reached. `None` for
     /// a terminal ply, which is pinned rather than searched. The grading compares against the ply
     /// *before*, so a position that searched much shallower than its predecessor drags the whole
     /// comparison down to its own depth — which is worth being able to see.
     search_depth: Option<usize>,
+    /// Nodes that same search spent — the companion to `search_depth`, and the number a consumer
+    /// should quote when it wants to say how hard this position was actually looked at. `None` on a
+    /// terminal ply for the same reason `search_depth` is.
+    search_nodes: Option<u64>,
     /// The mover's win probability before this ply, from the primary grade's `cp_before`.
     win_prob_before: f64,
     /// This ply handed the opponent a proven win.
@@ -588,6 +633,9 @@ fn make_info(nodes: u64, table: &HashTable) -> SearchInfo<'_> {
 struct Searched {
     score: i32,
     roots: Vec<(GameMove, i32)>,
+    /// The line behind each entry of `roots`, same order (`SearchInfo::multi_pv_lines`). Empty for
+    /// a terminal position, and never longer than `roots`.
+    lines: Vec<Vec<GameMove>>,
     /// `(depth, score)` for every fully-completed iteration, ascending. Empty for a terminal
     /// position, which is pinned rather than searched.
     depths: Vec<(usize, i32)>,
@@ -599,7 +647,13 @@ struct Searched {
 impl Searched {
     /// A position that was never searched because the game had already ended there.
     fn terminal(score: i32) -> Self {
-        Self { score, roots: Vec::new(), depths: Vec::new(), pv: Vec::new() }
+        Self {
+            score,
+            roots: Vec::new(),
+            lines: Vec::new(),
+            depths: Vec::new(),
+            pv: Vec::new(),
+        }
     }
     /// The best root move's score; falls back to the position score if the root list is empty
     /// (possible when the node budget was too small to complete even one depth).
@@ -613,6 +667,30 @@ impl Searched {
     /// The best root move *other* than `mv` — the alternative a ply is graded against.
     fn best_other_move(&self, mv: GameMove) -> Option<GameMove> {
         self.roots.iter().map(|&(m, _)| m).find(|&m| m != mv)
+    }
+    /// The second-best root move, its exact score, and the line behind it — the other half of what
+    /// multi-PV 2 found here.
+    ///
+    /// Free: this is the same pair `root_gap` measures `sharp_cp` from, and multi-PV builds the line
+    /// for every index whether or not anyone keeps it, so none of this costs a node.
+    ///
+    /// The line is empty rather than absent when the search didn't retain one (a single-PV search,
+    /// or an index that produced a move but no stored line), so a caller can always fall back to the
+    /// move itself.
+    ///
+    /// `None` when multi-PV found only one move, or when the second index came back holding a
+    /// window bound rather than an evaluation (see `root_gap`).
+    fn runner_up(&self) -> Option<(GameMove, i32, &[GameMove])> {
+        match self.roots.as_slice() {
+            [_, (mv, cp), ..] if is_real_score(*cp) => Some((
+                *mv,
+                *cp,
+                // Index-parallel with `roots` by construction, but read defensively: a search that
+                // was not multi-PV records no lines at all.
+                self.lines.get(1).map(|l| l.as_slice()).unwrap_or(&[]),
+            )),
+            _ => None,
+        }
     }
     /// How much the best root move beat the runner-up by. Both scores come from the same search at
     /// the same depth for the same side to move, so no alignment is needed. `None` when multi-PV
@@ -651,6 +729,7 @@ where
     Searched {
         score,
         roots: info.root_choices().to_vec(),
+        lines: info.multi_pv_lines().to_vec(),
         depths: info.depth_scores().to_vec(),
         pv: outcome.map(|o| o.pv).unwrap_or_default(),
     }
@@ -1130,6 +1209,10 @@ where
 
         // Search the position this ply reached. Its score is this ply's bar; its root moves grade
         // the next ply. A game-ending ply is pinned instead of searched.
+        // `search_nodes` is what that search cost, kept per ply rather than only summed into the
+        // run's total: it is the honest answer to "how hard was this position looked at?", which
+        // the budget alone cannot give once a search finishes early.
+        let mut search_nodes = None;
         let after = match terminal {
             Some(GameResult::WhiteWin) => {
                 Searched::terminal(if player == Color::White { WIN_SCORE } else { LOSE_SCORE })
@@ -1140,7 +1223,9 @@ where
             Some(GameResult::Draw) => Searched::terminal(0),
             None => {
                 let s = search_position(&mut board, &mut eval, &mut info);
-                nodes += info.nodes() as u64;
+                let spent = info.nodes() as u64;
+                search_nodes = Some(spent);
+                nodes += spent;
                 s
             }
         };
@@ -1149,6 +1234,17 @@ where
         // the engine's answer to "and then what?", with its recommended reply first. Taken here,
         // while the board still sits on that position and before the regrade below borrows it back.
         let pv = pv_ptn(&mut board, &after.pv);
+
+        // ...and the other line that search looked at. Same position, same search, same depth, so
+        // its score needs no alignment against `score_white` below — the two are the best and
+        // second-best readings of one position. Spelled here for the same reason the PV is: the
+        // board is standing on the position these moves are played in, which is what `short_ptn`
+        // and `pv_ptn` need to get the count and the crush flag right.
+        let runner_up = after.runner_up().map(|(mv, cp, line)| RunnerUp {
+            display: short_ptn(&board, mv),
+            score_white: to_white_frame(&board, cp),
+            pv: pv_ptn(&mut board, line),
+        });
 
         let (score_white, win_prob_white) = match terminal {
             Some(GameResult::WhiteWin) => (i32::MAX, 1.0),
@@ -1331,8 +1427,13 @@ where
         // this gate used to do wrong — and a ply whose loss read as thousands of cp was skipped
         // here for being far past the caller's threshold when it had barely given anything up.
         let loss_pct = grade.loss_win_pct().unwrap_or(f64::INFINITY);
+        // How settled the game was, from the leader's side whichever that is (see
+        // `alts_min_decided`). The mover's own probability is the wrong reading here: a position
+        // one player has locked up is equally locked up for the other, and the moves worth
+        // enumerating alternatives for come from both of them.
+        let decided = win_prob_before.max(1.0 - win_prob_before);
         let alts = if cfg.alts > 0
-            && win_prob_before >= cfg.alts_min_win_prob
+            && decided >= cfg.alts_min_decided
             && loss_pct <= cfg.alts_max_loss_pct
         {
             board.reverse_move(rev_played);
@@ -1340,7 +1441,8 @@ where
                 .set_multi_pv(cfg.alts)
                 .full_root_moves(true);
             let searched = search_position(&mut board, &mut eval, &mut alt_info);
-            nodes += alt_info.nodes() as u64;
+            let alt_nodes = alt_info.nodes() as u64;
+            nodes += alt_nodes;
 
             let mut played_cp = None;
             let mut moves = Vec::with_capacity(searched.roots.len());
@@ -1370,7 +1472,7 @@ where
                 moves.push(Alternative { display, cp, facts });
             }
             board.do_move(mv);
-            Some(Alternatives { played_cp, moves })
+            Some(Alternatives { played_cp, nodes: alt_nodes, moves })
         } else {
             None
         };
@@ -1416,7 +1518,9 @@ where
             largest_capture,
             largest_capture_after,
             pv,
+            runner_up,
             search_depth: after.deepest(),
+            search_nodes,
             // Already computed above: the `--alts` gate reads it too.
             win_prob_before,
             solved_loss,
@@ -1508,10 +1612,11 @@ fn alts_json(a: &Alternatives) -> String {
         })
         .collect();
     format!(
-        "{{\"played_cp\": {}, \"moves\": [{}]}}",
+        "{{\"played_cp\": {}, \"nodes\": {}, \"moves\": [{}]}}",
         a.played_cp
             .map(|cp| format!("{:.2}", cp as f64 / 4.0))
             .unwrap_or_else(|| "null".to_string()),
+        a.nodes,
         moves.join(", ")
     )
 }
@@ -1569,11 +1674,12 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
              \"loss_cp\": {:.2}, \
              \"loss_exact\": {}, \"sharp_cp\": {}, \"fcd\": {}, \"ocs_added\": {}, \
              \"move_top\": {}, \"largest_capture\": {}, \"largest_capture_after\": {}, \
-             \"pv\": [{}], \
+             \"pv\": [{}], \"runner_up\": {}, \
              \"cp_before\": {:.2}, \
              \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \
              \"win_prob_before\": {:.6}, \
-             \"solved_loss\": {}, \"played_best\": {}, \"search_depth\": {}, \"regraded\": {}{}{}{}}}",
+             \"solved_loss\": {}, \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}, \
+             \"regraded\": {}{}{}{}}}",
             p.index,
             p.move_number,
             match p.player {
@@ -1609,6 +1715,15 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
                 .map(|m| format!("\"{m}\""))
                 .collect::<Vec<_>>()
                 .join(", "),
+            p.runner_up
+                .as_ref()
+                .map(|r| format!(
+                    "{{\"display\": \"{}\", \"cp_white\": {:.2}, \"pv\": [{}]}}",
+                    r.display,
+                    r.score_white as f64 / 4.0,
+                    r.pv.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ")
+                ))
+                .unwrap_or_else(|| "null".to_string()),
             g.cp_before as f64 / 4.0,
             g.cmp_played as f64 / 4.0,
             g.cmp_other as f64 / 4.0,
@@ -1617,6 +1732,9 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
             p.played_best,
             p.search_depth
                 .map(|d| d.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            p.search_nodes
+                .map(|n| n.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             p.regraded,
             // Per-method detail, for calibrating one against the other. The flat fields above are
@@ -1818,13 +1936,20 @@ mod tests {
         let sentinel = Searched {
             score: 250_000,
             roots: Vec::new(),
+            lines: Vec::new(),
             depths: vec![(1, 250_000)],
             pv: Vec::new(),
         };
         assert_eq!(sibling_value(&sentinel), None);
 
         // ...and an ordinary one comes back negated into the mover's frame.
-        let ok = Searched { score: -1620, roots: Vec::new(), depths: vec![(9, -1620)], pv: Vec::new() };
+        let ok = Searched {
+            score: -1620,
+            roots: Vec::new(),
+            lines: Vec::new(),
+            depths: vec![(9, -1620)],
+            pv: Vec::new(),
+        };
         assert_eq!(sibling_value(&ok), Some(1620));
     }
 }

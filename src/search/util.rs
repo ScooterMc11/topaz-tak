@@ -56,6 +56,14 @@ pub struct SearchInfo<'a> {
     /// `multi_pv` entries). Lets a caller weaken the engine by sampling among the top moves instead
     /// of always taking the best (see `select_softmax`). Empty until the first depth completes.
     pub(crate) root_choices: Vec<(GameMove, i32)>,
+    /// The deepest fully-completed iteration's **principal variation per multi-PV index**, index
+    /// order, parallel to `root_choices` — `multi_pv_lines[i][0]` is `root_choices[i].0`.
+    ///
+    /// Multi-PV already builds a full line for every index; without this they are printed and
+    /// dropped, leaving a caller the second-best *move* but not the line behind it. Snapshotted
+    /// where `root_choices` is, so the two always describe the same iteration. Empty on a
+    /// single-PV search, which has nothing to report beyond the outcome's own PV.
+    pub(crate) multi_pv_lines: Vec<Vec<GameMove>>,
     /// Per-depth `(depth, best_score)` for the principal variation, appended once each iteration
     /// completes fully (an aborted final depth is not recorded). Lets a caller read the whole
     /// eval-vs-depth curve from a single iterative-deepening search (see `start_eval`). Empty until
@@ -96,6 +104,7 @@ impl<'a> SearchInfo<'a> {
             forbidden_root_moves: SimpleMoveList::new(),
             full_root_moves: false,
             root_choices: Vec::new(),
+            multi_pv_lines: Vec::new(),
             depth_scores: Vec::new(),
             progress: None,
         }
@@ -109,6 +118,10 @@ impl<'a> SearchInfo<'a> {
     /// The deepest completed iteration's root moves with scores, best first (see field docs).
     pub fn root_choices(&self) -> &[(GameMove, i32)] {
         &self.root_choices
+    }
+    /// The same iteration's line behind each of those root moves (see field docs).
+    pub fn multi_pv_lines(&self) -> &[Vec<GameMove>] {
+        &self.multi_pv_lines
     }
     /// Per-depth `(depth, best_score)` for every fully-completed iteration (see field docs).
     pub fn depth_scores(&self) -> &[(usize, i32)] {
