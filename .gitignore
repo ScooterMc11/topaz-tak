@@ -16,6 +16,10 @@ src/*.bin
 /6x6/
 results.html
 *.log
+# balancedlines runs. The results already committed here stay tracked — this only stops the loose
+# ones a run leaves behind (`.progress` files, hand-made copies) from turning up as untracked noise,
+# so a result worth keeping now needs `git add -f`.
+/balancedOpeningLineCounterResults/
 
 # Bot manager web app: deps, builds, the local (plaintext-password) config, and saved game logs
 bot-manager-app/**/node_modules/
