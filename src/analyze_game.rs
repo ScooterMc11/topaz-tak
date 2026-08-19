@@ -65,6 +65,12 @@
 //!   - `fcd` — flat-count differential: how far the ply moved the mover's flat lead.
 //!   - `cp_before` / `win_prob_before` — the position's value before the ply, mover's frame.
 //!   - `solved_loss` — the ply handed the opponent a proven win.
+//!   - `best_alt` — only on a ply that did: the best *other* move in that position, searched on the
+//!     same terms the played move was, as `{display, cp, solved_loss}` (`cp` in the mover's frame).
+//!     `solved_loss` on it means the alternative hands the win over as well, so the mover had no way
+//!     out the search can see and the ply they chose was not the losing decision. `null` on every
+//!     other ply, and where the position had only the one move. See `BestAlt` for why the position's
+//!     own score cannot answer this and one alternative is enough.
 //!   - `ocs_added` — of the squares the ply touched, how many the opponent controls after it (see
 //!     `ocs_added` below).
 //!   - `move_top` — for a stack movement, what was on top of the stack it moved: `"flat"`, `"wall"`
@@ -606,6 +612,9 @@ struct PlyAnalysis {
     win_prob_before: f64,
     /// This ply handed the opponent a proven win.
     solved_loss: bool,
+    /// What the best *other* move in that position would have come to, on a ply that did. `None`
+    /// everywhere else, and where there was no other move to try. See `BestAlt`.
+    best_alt: Option<BestAlt>,
     /// The depth-aligned grade, when computed.
     aligned: Option<Grade>,
     /// The sibling-search grade, when computed.
@@ -1048,6 +1057,69 @@ where
     };
     board.reverse_move(rev);
     value
+}
+
+/// The best move other than the one played, searched the way the played move was — the evidence
+/// behind "was this loss the mover's doing?".
+///
+/// **Why `cp_before` cannot answer that.** It comes from a multi-PV search of the position, spreading
+/// one budget across every root move, while `solved_loss` comes from a dedicated search of one child
+/// one ply deeper. So "the opponent has a forced win after your move" becomes provable long before
+/// "you were lost whatever you played" does, and a position where every move loses can still report
+/// an ordinary evaluation. Measured on Takana's games: in two positions reading -430 and -778cp,
+/// every one of the top 16 alternatives was a *proven* loss once searched individually at the same
+/// budget the played move got.
+///
+/// **One alternative, not the whole root list.** The best move's verdict matched the full 16-move
+/// sweep in every position measured, and each further move is another full search. This is a probe,
+/// not a proof: it says the best way out also loses, which is not quite "every move loses", and the
+/// two come apart only where the root ordering is itself meaningless.
+struct BestAlt {
+    display: String,
+    /// Its value in the **mover's** frame, like `Grade::cmp_played`.
+    value: i32,
+    /// It hands the opponent a proven win as well.
+    solved_loss: bool,
+}
+
+/// Play `alt` from the position before the ply, search it on the played move's own terms, and report
+/// what it would have come to. Leaves the board as it found it.
+fn best_alt_outcome<B, E>(
+    board: &mut B,
+    eval: &mut E,
+    info: &mut SearchInfo,
+    alt: GameMove,
+    player: Color,
+    nodes: &mut u64,
+) -> BestAlt
+where
+    B: TakBoard,
+    E: Evaluator<Game = B>,
+{
+    // Spelled before the move, while the source stack is still intact.
+    let display = short_ptn(board, alt);
+    let rev = board.do_move(alt);
+    let (value, solved_loss) = match board.game_result() {
+        // A move that ends the game is pinned rather than searched, exactly as the played move is.
+        Some(result) => (
+            terminal_value(result, player),
+            match result {
+                GameResult::WhiteWin => player == Color::Black,
+                GameResult::BlackWin => player == Color::White,
+                GameResult::Draw => false,
+            },
+        ),
+        None => {
+            let searched = search_position(board, eval, info);
+            *nodes += info.nodes() as u64;
+            // The search scores the position from the *opponent's* view — they are to move there —
+            // so the mover's value is its negation, and a proven win for them is the loss this is
+            // asking about. Same test `solved_loss` applies to the played move.
+            (-searched.score, searched.score >= WIN_SCORE - SOLVED_MARGIN)
+        }
+    };
+    board.reverse_move(rev);
+    BestAlt { display, value, solved_loss }
 }
 
 /// The comparison endpoints for a sibling measurement, as `(played, other)`.
@@ -1690,6 +1762,20 @@ where
             None => after.score >= WIN_SCORE - SOLVED_MARGIN,
         };
 
+        // Would the best alternative have lost as well? Asked only on the plies where the answer
+        // changes something, which is what keeps it to one extra search on one ply in a game or
+        // three rather than on every ply of every game.
+        let best_alt = solved_loss
+            .then(|| before.best_other_move(mv))
+            .flatten()
+            .map(|alt| {
+                board.reverse_move(rev_played);
+                let out =
+                    best_alt_outcome(&mut board, &mut eval, &mut info, alt, player, &mut nodes);
+                board.do_move(mv);
+                out
+            });
+
         if !cfg.quiet {
             eprintln!(
                 "analyzegame: ply {}/{} {} -> {:+.1} cp ({:.3})",
@@ -1728,6 +1814,7 @@ where
             // Already computed above: the `--alts` gate reads it too.
             win_prob_before,
             solved_loss,
+            best_alt,
             aligned,
             sibling,
             played_best,
@@ -1883,7 +1970,8 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
              \"cp_before\": {:.2}, \
              \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \
              \"win_prob_before\": {:.6}, \
-             \"solved_loss\": {}, \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}, \
+             \"solved_loss\": {}, \"best_alt\": {}, \
+             \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}, \
              \"regraded\": {}{}{}{}{}}}",
             p.index,
             p.move_number,
@@ -1934,6 +2022,15 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
             g.cmp_other as f64 / 4.0,
             p.win_prob_before,
             p.solved_loss,
+            p.best_alt
+                .as_ref()
+                .map(|b| format!(
+                    "{{\"display\": \"{}\", \"cp\": {:.2}, \"solved_loss\": {}}}",
+                    b.display,
+                    b.value as f64 / 4.0,
+                    b.solved_loss
+                ))
+                .unwrap_or_else(|| "null".to_string()),
             p.played_best,
             p.search_depth
                 .map(|d| d.to_string())
