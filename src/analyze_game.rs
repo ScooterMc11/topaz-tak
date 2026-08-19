@@ -1,4 +1,4 @@
-//! Whole-game analysis for TakAnalyzerBot's `/analyze` game sheet.
+//! Whole-game analysis for Takana's `/analyze` game sheet.
 //!
 //! Walks a game's plies from the initial position, evaluates every resulting position with a fixed
 //! **node** budget, and prints one JSON document with a per-ply evaluation plus the game statistics
@@ -12,6 +12,12 @@
 //! flipped when Black is to move), as internal cp, human cp (`internal / 4`), and as a win
 //! probability `sigmoid(internal / 400)` — the engine's own trained scale, shared with the trainer
 //! (`datagen.rs`). Terminal positions are pinned to 1 / 0 / ½ rather than searched.
+//!
+//! A position's reported value is **not** its deepest completed iteration but a weighted average of
+//! the last few (`DEPTH_KERNEL`), because a fixed node budget stops adjacent positions at different
+//! depths and the difference between two such readings is partly the searches disagreeing rather than
+//! the positions differing. `search_depth` still reports the deepest iteration that completed, so it
+//! names the top of that window rather than the depth of a single reading.
 //!
 //! **Statistics** (one column per player in the sheet):
 //!   - `calls` — plies that put the opponent *into* tak. Only transitions count: a ply is a call when
@@ -36,7 +42,7 @@
 //!
 //! **Starting anywhere.** `--tps` starts the walk from a given position instead of the empty board,
 //! which makes this a single-position tool as well as a whole-game one: `--tps <position> --plies
-//! <move>` grades exactly one move, which is what TakAnalyzerBot's `scripts/positionAnalyzer.js`
+//! <move>` grades exactly one move, which is what Takana's `scripts/positionAnalyzer.js`
 //! uses to regression-test badge tuning against moves a human already has an opinion about. Ply
 //! *numbering* is recovered from the position (`ply_offset`), not restarted at 1, so a ply analyzed
 //! out of a TPS lands in the same opening/rarity bands it would have reached by replaying the game
@@ -99,6 +105,26 @@
 //! anyway — no second search, and no fixed depth limit either. For each adjacent pair the comparison
 //! depth is `D = min(deepest(parent), deepest(child) + 1)`, so a position that ran out of nodes
 //! early just gets compared shallower instead of being mismatched.
+//!
+//! **Every reading is averaged over the last few iterations** rather than taken from the deepest one
+//! alone — the parent across `D, D-1, ...` and the child across `D-1, D-2, ...`, weighted by
+//! `DEPTH_KERNEL`. That constant carries the measurements and is the only place to change it; what
+//! follows is why there are two different reasons for it.
+//!
+//! For the **curve** it fixes a real error. Adjacent positions get the same node budget but rarely
+//! stop at the same depth, and a search of depth `D` from one position and depth `D` from the next
+//! do not look the same distance down the tree — the parity is opposite. So the bar moves because the
+//! *search* changed rather than because the *position* did, and it moves most on exactly the plies
+//! where it should not move at all: a move the engine itself would have played is worth what the
+//! position before it was worth, and the curve stepped a mean 1.33 win points across those anyway,
+//! up to 11. Averaging mixes the parities instead of picking one, and halves it.
+//!
+//! For the **grade** it fixes nothing, because every pairing in the window is already horizon-matched
+//! — that is what `align` does. It is applied there so the badge and the bar are read off the same
+//! thing: with the curve smoothed and the grade not, the two disagree by 1.09 win points on an
+//! average non-best ply, against 0.70 with both. The grade's *accuracy* barely moves (0.21 win points
+//! better, and band flips stay a coin toss), so if this is ever reconsidered, reconsider it as a
+//! consistency choice and not an accuracy one.
 //!
 //! This engine has no quiescence search — leaf nodes are a static eval behind a hard horizon (see
 //! `alpha_beta`'s `depth == 0` arm) — so the parity effect is the dominant error term and aligning
@@ -185,6 +211,47 @@ const EVAL_SCALE: f64 = 400.0;
 /// what a deeper search says and still pass.
 const MAX_GRADE_DRIFT: f64 = 2.0;
 
+/// How a position is read off its own iterative-deepening ladder: weights for the deepest completed
+/// iteration, the one below it, and so on. `&[1]` is "deepest only", which is what this module did
+/// before depth averaging.
+///
+/// **One knob, two consumers.** The sheet's curve (`score_white`) and the aligned grade (`align`)
+/// both read through it, deliberately: smoothing one and not the other is the configuration that
+/// leaves the eval bar and the badge on different footings, which is the thing this was built to fix.
+/// Changing this constant changes both together. `smooth_ladder` is where the arithmetic lives and
+/// where the edge cases (short ladders, proven wins) are handled.
+///
+/// **Measured, not reasoned** — 2026-08-14/15, PlayTak 858074 / 812688 / 864344 / 863024 at 200k
+/// nodes/ply against a 1.6M reference. What each window buys, on the three things that move:
+///
+/// | weights | phantom curve step on a best ply | bar-vs-badge gap | regrade rate |
+/// |---|---|---|---|
+/// | `[1]` (before) | 1.33 | 1.12 | 18.1% |
+/// | `[3, 2, 1]` | 0.98 | 0.70 | 20.4% |
+/// | `[1, 1, 1]` | 0.94 | — | 20.8% |
+/// | `[1, 1, 1, 1]` | 0.83 | 0.58 | 28.3% |
+///
+/// The first column is the honest one: a ply the engine itself would have played is worth exactly
+/// what the position before it was worth, so the curve should not move across it at all, and every
+/// point it does move is measurement error. It halves because adjacent positions rarely stop at the
+/// same depth — the error runs 0.80 win points when the child searched one shallower (horizons
+/// already matched), 1.57 at equal depth and 1.78 when the child searched deeper, and averaging
+/// mixes the parities instead of picking one.
+///
+/// **Window length is what matters; the shape barely does** (a flat `[1, 1, 1]` scores 0.94 against
+/// this one's 0.98). Parity-cancelling shapes — `[2, 2, 1, 1]`, `[3, 3, 1, 1]`, whose alternating sum
+/// is zero — were tried on the theory that they would cancel the odd/even component exactly, and they
+/// are no better than flat windows of the same length. Medians instead of means were tried too, on
+/// the theory that they would reject a single outlier depth, and they are worse on every measure.
+///
+/// **What it does not buy: better badges.** Of the plies whose band changes under this kernel, 15
+/// land on the reference's band and 14 land off it. The underlying loss estimate does improve, by
+/// 0.21 win points (95% CI [0.07, 0.36], paired over 144 plies), but that is small against bands 0.5
+/// to 15 points wide, so band flips stay close to a coin toss. The case for averaging the grade is
+/// the second column — the sheet agreeing with itself — not accuracy. Longer windows buy more of it
+/// and cost regrades; going past 4 also starts costing curve accuracy against the reference.
+const DEPTH_KERNEL: &[i64] = &[3, 2, 1];
+
 /// Which method measures how much a ply gave up. See the module docs for what each one does and why
 /// the naive parent-vs-child difference is not among them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,6 +331,11 @@ pub struct AnalyzeGameConfig {
     /// normalised footing the caller grades on (`loss_cp` against `cp_before`). A ply the loss
     /// method could not grade at all never qualifies.
     pub alts_max_loss_pct: f64,
+    /// Attach every fully-completed iteration's score to each ply (`depth_scores`), as a diagnostic.
+    /// Free — the search already records them (`SearchInfo::depth_scores`) — but off by default
+    /// because nothing in the contract reads them; they exist so multi-depth grading and curve
+    /// smoothing can be evaluated offline from one run.
+    pub depth_scores: bool,
 }
 
 impl Default for AnalyzeGameConfig {
@@ -280,6 +352,7 @@ impl Default for AnalyzeGameConfig {
             alts: 0,
             alts_min_decided: 0.0,
             alts_max_loss_pct: f64::INFINITY,
+            depth_scores: false,
         }
     }
 }
@@ -306,6 +379,13 @@ struct Grade {
     /// the best estimate available, because that is what the bar draws and what decides how settled
     /// the game already was. Reading it at the comparison depth instead made a resolved position look
     /// live, which let a lost position keep collecting Fatal badges.
+    ///
+    /// **Not smoothed through `DEPTH_KERNEL`, unlike the sheet's bar.** It comes from `top()`, the
+    /// best *root move's* score, and only the final iteration's root list survives the search — there
+    /// is no per-depth root ladder to average. Smoothing it would mean recording `root_choices` per
+    /// iteration in `search`, which is a change to the search rather than to this module. So this and
+    /// `sharp` are the two grading numbers still read at a single depth; the gap that leaves between
+    /// `cp_before` and the previous ply's bar is a fraction of a win point and predates this.
     cp_before: i32,
     /// The value this method assigned to the move actually played, on its own footing. Compared
     /// against the deepest reading of the same position to detect a grade the search has outgrown.
@@ -421,8 +501,13 @@ struct RunnerUp {
     /// The move in conventional short PTN, spelled against the position it is played in. Always the
     /// first entry of `pv`, kept separately because the line can come back empty.
     display: String,
-    /// Its score in **White's frame**, so it sits directly beside the ply's `cp_white` — the two are
-    /// the best and second-best readings of one position from one search.
+    /// Its score in **White's frame**, so it sits directly beside the ply's `cp_white`.
+    ///
+    /// **Read at the final iteration only**, where `cp_white` is now averaged over the last few
+    /// (`DEPTH_KERNEL`), so the two are no longer strictly the best and second-best readings of one
+    /// search: only the root list of the last iteration survives, and there is no per-depth ladder to
+    /// average — the same limitation `Grade::cp_before` carries. A consumer subtracting one from the
+    /// other to recover a gap should use `sharp_cp` instead, which is both ends from one iteration.
     score_white: i32,
     /// The line behind it, in short PTN, on the same terms as the ply's own `pv` — replayed on the
     /// board so the spelling and crush flags are right, and truncated at anything unplayable.
@@ -492,7 +577,7 @@ struct PlyAnalysis {
     /// depends on what led the spread. Against a wall or capstone, what matters is the stack you
     /// took — the height going in. Against a flat, the leading piece ends up on top of whatever it
     /// lands on and the stack it leaves behind is what the move built, so the height coming out is
-    /// the number with meaning. TakAnalyzerBot's `src/badges.js` picks between them on `move_top`
+    /// the number with meaning. Takana's `src/badges.js` picks between them on `move_top`
     /// and scores each against its own table.
     ///
     /// Always at least 1 for a flat-led spread — the carry keeps its order, so the leading flat is
@@ -509,6 +594,9 @@ struct PlyAnalysis {
     /// a terminal ply, which is pinned rather than searched. The grading compares against the ply
     /// *before*, so a position that searched much shallower than its predecessor drags the whole
     /// comparison down to its own depth — which is worth being able to see.
+    ///
+    /// The **top of the reading window**, not the depth of a single reading: `score_white` averages
+    /// this iteration with the ones below it (`DEPTH_KERNEL`).
     search_depth: Option<usize>,
     /// Nodes that same search spent — the companion to `search_depth`, and the number a consumer
     /// should quote when it wants to say how hard this position was actually looked at. `None` on a
@@ -530,6 +618,10 @@ struct PlyAnalysis {
     regraded: bool,
     /// The other moves available here, when this ply passed the `--alts` gates.
     alts: Option<Alternatives>,
+    /// Every fully-completed iteration of the search of the position this ply reached, as
+    /// `(depth, White-frame internal score)`, ascending. Empty unless `--depth-scores` asked for it,
+    /// and on a terminal ply, which is pinned rather than searched. Diagnostic only.
+    depth_scores: Vec<(usize, i32)>,
 }
 
 impl PlyAnalysis {
@@ -609,6 +701,56 @@ fn is_solved(score: i32) -> bool {
 /// pairing separately — see `is_solved`.
 fn drift_win_pct(a: i32, b: i32) -> f64 {
     (sigmoid(a as f64 / EVAL_SCALE) - sigmoid(b as f64 / EVAL_SCALE)).abs() * 100.0
+}
+
+/// Read a position off its depth ladder as a weighted average of the iteration ending at `top` and
+/// the ones below it, per `DEPTH_KERNEL`. `None` when `top` itself never completed.
+///
+/// The window shortens rather than fails, in three situations, all of which occur in real games:
+///
+/// - **The ladder runs out.** A position whose budget bought only three iterations cannot be read
+///   four deep. Weights are renormalised over what is there, so the deepest reading always dominates.
+/// - **An iteration is missing from the middle.** `depth_scores` only records iterations that
+///   completed, so a gap is possible in principle; the window stops at the gap rather than reaching
+///   past it and silently averaging non-adjacent depths.
+/// - **A proven win is in range.** Win scores are `WIN_SCORE - distance`, thousands of cp from any
+///   evaluation, so averaging the two produces a number that is neither. The window stops below the
+///   shallowest solved reading — but the reading *at* `top` is always kept, solved or not, so a
+///   position the search solved still reports its proof rather than a blend. This is the same
+///   boundary `is_solved` guards in `distrust_aligned`, for the same reason. It catches the search's
+///   window sentinels too, which sit further out still (`is_real_score`) — those are not scores at
+///   all, and averaging one in would drag a whole position thousands of cp.
+///
+/// Rounds to the nearest internal cp, away from zero on a tie. Internal cp are quarter-human-cp, so
+/// the rounding error is at most 0.125 human cp — a hundredth of a win point where the sigmoid is
+/// steepest, and less everywhere else.
+fn smooth_ladder(depths: &[(usize, i32)], top: usize, weights: &[i64]) -> Option<i32> {
+    let score_at = |d: usize| depths.iter().find(|&&(x, _)| x == d).map(|&(_, s)| s);
+    let first = score_at(top)?;
+    let (mut num, mut den) = (0i64, 0i64);
+    for (i, &w) in weights.iter().enumerate() {
+        // `top - i` would wrap at depth 0, and there is no iteration 0 to read anyway.
+        let Some(depth) = top.checked_sub(i).filter(|&d| d > 0) else { break };
+        let Some(score) = score_at(depth) else { break };
+        // The reading at `top` is the position's answer and is kept whatever it is; anything below
+        // it that crosses into proven-win territory ends the window.
+        if i > 0 && is_solved(score) {
+            break;
+        }
+        num += w * score as i64;
+        den += w;
+        // A solved reading at `top` is reported alone rather than blended into the evaluations below.
+        if i == 0 && is_solved(first) {
+            break;
+        }
+    }
+    if den == 0 {
+        return Some(first);
+    }
+    // Round half away from zero: `num / den` truncates toward zero in Rust, which would bias every
+    // averaged reading a fraction of a cp toward the draw.
+    let rounded = if num >= 0 { (num + den / 2) / den } else { (num - den / 2) / den };
+    Some(rounded as i32)
 }
 
 /// Build a search configured to spend a fixed node budget: `abort_depth(1)` lets the soft-node check
@@ -714,6 +856,16 @@ impl Searched {
     fn score_at(&self, depth: usize) -> Option<i32> {
         self.depths.iter().find(|&&(d, _)| d == depth).map(|&(_, s)| s)
     }
+    /// This position's score read across `DEPTH_KERNEL`, ending at `depth`.
+    fn smoothed_at(&self, depth: usize) -> Option<i32> {
+        smooth_ladder(&self.depths, depth, DEPTH_KERNEL)
+    }
+    /// This position's value as the sheet draws it: the kernel applied at the deepest iteration that
+    /// completed. Falls back to the raw search score for a position with no ladder at all — a
+    /// terminal position, which is pinned, or a budget too small to finish one iteration.
+    fn smoothed(&self) -> i32 {
+        self.deepest().and_then(|d| self.smoothed_at(d)).unwrap_or(self.score)
+    }
 }
 
 /// Search one position with the transposition table cleared first, so the result is a pure function
@@ -780,6 +932,17 @@ fn pv_ptn<B: TakBoard>(board: &mut B, pv: &[GameMove]) -> Vec<String> {
 /// same horizon under both. `D` is the deepest pairing both searches actually completed, so a
 /// position that ran out of nodes early is compared shallower rather than mismatched.
 ///
+/// Both ends are then read through `DEPTH_KERNEL` — the parent across `D, D-1, ...` and the child
+/// across `D-1, D-2, ...` — so the pairing is a weighted average of several aligned comparisons
+/// rather than one. Every pairing in the window is horizon-matched by construction, so this is not
+/// fixing a parity problem the way the curve's smoothing is; it is here so the badge and the eval
+/// bar are read off the same thing. See `DEPTH_KERNEL` for what that is worth and what it is not.
+///
+/// **Averaged in cp, not in win probability.** The endpoints are the contract (`Grade::cmp_played`),
+/// and callers subtract them through the sigmoid themselves, so the averaging has to happen before
+/// that or the exported numbers stop being the ends of the comparison they are documented as. The
+/// two orders differ by 0.009 win points on average and 0.09 at worst, measured over 144 plies.
+///
 /// `parent` is in the mover's frame; `child` is in the opponent's, hence the negation. Returns
 /// `None` when no valid pairing exists — the child needs a completed depth 1, so the parent needs 2.
 fn align(parent: &Searched, child: &Searched, played_best: bool) -> Option<Grade> {
@@ -789,8 +952,13 @@ fn align(parent: &Searched, child: &Searched, played_best: bool) -> Option<Grade
     }
     // The *reference* is the parent at the matched depth; the position's reported value is its
     // deepest reading. See `Grade::cp_before` for why those must not be the same number.
-    let reference = parent.score_at(depth)?;
-    let played_value = -child.score_at(depth - 1)?;
+    //
+    // The two windows shorten independently (`smooth_ladder`), which is deliberate: they are
+    // readings of two different positions and each is entitled to whatever ladder its own search
+    // built. `depth` already caps both at the shallower search, so neither can run away from the
+    // other by more than the kernel's own length.
+    let reference = parent.smoothed_at(depth)?;
+    let played_value = -child.smoothed_at(depth - 1)?;
     let raw = reference - played_value;
     let sharp = if played_best { parent.root_gap() } else { None };
     // A ply the engine chose is compared against the runner-up, and both ends of *that* comparison
@@ -817,6 +985,14 @@ fn align(parent: &Searched, child: &Searched, played_best: bool) -> Option<Grade
 
 /// What a sibling search says the move it played is worth, in the **mover's** frame — `None` when
 /// the search came back with nothing worth comparing against.
+///
+/// **Read at the search's own deepest, not through `DEPTH_KERNEL`**, and deliberately so. Both ends
+/// of a sibling comparison are full-budget searches of positions the same distance down the game, so
+/// there is no horizon to reconcile — which is the whole reason this method is the authority when the
+/// aligned pairing is distrusted. Smoothing it would make the fallback depend on the same ladder the
+/// thing it is checking depends on. The cost is that on a regraded ply the badge and the eval bar are
+/// back on different footings; that is a known gap, and the bar-vs-badge figure quoted in
+/// `DEPTH_KERNEL` was measured on the aligned path only.
 ///
 /// Two ways that happens, and both would otherwise pass silently into a cp subtraction and come out
 /// looking like a real grade. A budget too small to finish even one iteration leaves `Searched::score`
@@ -889,8 +1065,23 @@ fn sibling_endpoints(played_value: i32, alt: i32, played_best: bool) -> (i32, i3
 /// the grading for what each arm is guarding against.
 ///
 /// `deepest_played` is the value of the position the ply reached at the deepest depth its own search
-/// completed — the number the sheet draws. The aligned grade read that same position at `D-1`, so the
-/// two are readings of one position and are entitled to agree.
+/// completed. The aligned grade read that same position around `D-1`, so the two are readings of one
+/// position and are entitled to agree.
+///
+/// **The two sides are deliberately on different footings.** `deepest_played` is the raw deepest
+/// reading; `g.played_value` is now smoothed across `DEPTH_KERNEL`, so a gap opens even where the
+/// ladder is perfectly well behaved and the guard fires more often: **18.1% of plies before depth
+/// averaging, 20.4% after** (measured over the four games in `DEPTH_KERNEL`'s table). Each firing is
+/// one extra sibling search, so that is the price.
+///
+/// Handing this the *smoothed* deepest reading instead would put both sides on one footing and drop
+/// the firing rate to **5.7%** — cheaper than before the change. That is not obviously the better
+/// trade, and it is not a tuning question: the guard's job is to notice when the pairing's reading is
+/// unreliable, and comparing a smoothed number against the same smoothing of the same position makes
+/// the two agree by construction. That is the shape of the blind spot documented in the module notes,
+/// where `drift_win_pct` returns 0 because both sides are the same number and no threshold can fire.
+/// If the firing rate ever needs to come down, change this call site rather than `MAX_GRADE_DRIFT`,
+/// and know which of the two you are buying.
 fn distrust_aligned(g: &Grade, deepest_played: i32) -> bool {
     // Nothing to trust: the method had no usable pair at all.
     if !g.exact {
@@ -1251,11 +1442,24 @@ where
             Some(GameResult::BlackWin) => (i32::MIN, 0.0),
             Some(GameResult::Draw) => (0, 0.5),
             None => {
-                let s = to_white_frame(&board, after.score);
+                // The curve is read through `DEPTH_KERNEL`, not off the deepest iteration alone.
+                // Adjacent positions rarely stop at the same depth, and the bar moving because the
+                // *search* changed rather than because the *position* did is what put visible steps
+                // on plies the engine itself would have played. See `DEPTH_KERNEL` for the numbers.
+                let s = to_white_frame(&board, after.smoothed());
                 (s, sigmoid(s as f64 / EVAL_SCALE))
             }
         };
         result = terminal;
+
+        // The same iteration-by-iteration record `align` grades from, put on the sheet's fixed White
+        // footing so a consumer can replay any pairing depth (or any smoothing of the curve) without
+        // re-searching. Read here, while the board still stands on the position `after` describes.
+        let depth_scores: Vec<(usize, i32)> = if cfg.depth_scores {
+            after.depths.iter().map(|&(d, s)| (d, to_white_frame(&board, s))).collect()
+        } else {
+            Vec::new()
+        };
 
         // ---- Grading, part 2: measure what the ply gave up ----
         //
@@ -1529,6 +1733,7 @@ where
             played_best,
             regraded,
             alts,
+            depth_scores,
         });
 
         flats_before = flats;
@@ -1679,7 +1884,7 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
              \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \
              \"win_prob_before\": {:.6}, \
              \"solved_loss\": {}, \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}, \
-             \"regraded\": {}{}{}{}}}",
+             \"regraded\": {}{}{}{}{}}}",
             p.index,
             p.move_number,
             match p.player {
@@ -1750,6 +1955,18 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
                 .as_ref()
                 .map(|a| format!(", \"alts\": {}", alts_json(a)))
                 .unwrap_or_default(),
+            if p.depth_scores.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", \"depth_scores\": [{}]",
+                    p.depth_scores
+                        .iter()
+                        .map(|&(d, s)| format!("[{}, {:.2}]", d, s as f64 / 4.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
         ));
     }
     s.push_str(&rows.join(",\n"));
@@ -1922,6 +2139,67 @@ mod tests {
     fn a_grade_with_nothing_to_compare_has_no_loss() {
         let g = Grade { cmp_played: 400, cmp_other: 120, exact: false, ..Default::default() };
         assert_eq!(g.loss_win_pct(), None);
+    }
+
+    #[test]
+    fn a_single_weight_kernel_is_the_deepest_reading() {
+        // The behaviour depth averaging replaced, kept reachable so the change is a knob and not a
+        // rewrite: `&[1]` must reproduce exactly what reading the deepest iteration used to give.
+        let ladder = [(9, 100), (10, 40), (11, 220)];
+        assert_eq!(smooth_ladder(&ladder, 11, &[1]), Some(220));
+        assert_eq!(smooth_ladder(&ladder, 10, &[1]), Some(40));
+    }
+
+    #[test]
+    fn the_kernel_weights_the_deepest_reading_most() {
+        // 3:2:1 over 220 / 40 / 100 = (660 + 80 + 100) / 6 = 140.
+        let ladder = [(9, 100), (10, 40), (11, 220)];
+        assert_eq!(smooth_ladder(&ladder, 11, &[3, 2, 1]), Some(140));
+        // ...and the window follows `top` down the ladder, which is what pairs the two sides of a
+        // grade: the child is read one shallower than the parent.
+        assert_eq!(smooth_ladder(&ladder, 10, &[3, 2, 1]), Some((40 * 3 + 100 * 2) / 5));
+    }
+
+    #[test]
+    fn a_short_ladder_renormalises_instead_of_failing() {
+        // Two completed iterations cannot fill a three-wide window. The weights that have readings
+        // behind them are the ones that count: (220 * 3 + 40 * 2) / 5 = 148.
+        let ladder = [(10, 40), (11, 220)];
+        assert_eq!(smooth_ladder(&ladder, 11, &[3, 2, 1]), Some(148));
+        // One iteration is just itself, and a depth that never completed has no reading at all.
+        assert_eq!(smooth_ladder(&[(1, 60)], 1, &[3, 2, 1]), Some(60));
+        assert_eq!(smooth_ladder(&ladder, 12, &[3, 2, 1]), None);
+    }
+
+    #[test]
+    fn a_gap_in_the_ladder_stops_the_window() {
+        // Only completed iterations are recorded, so depths need not be contiguous. Reaching past a
+        // gap would average readings that are two apart as though they were adjacent.
+        let ladder = [(8, 900), (10, 40), (11, 220)];
+        assert_eq!(smooth_ladder(&ladder, 11, &[3, 2, 1]), Some(148));
+    }
+
+    #[test]
+    fn a_proven_win_is_never_averaged_with_an_evaluation() {
+        // A mate score is thousands of cp from any evaluation, so blending the two produces a number
+        // that is neither a proof nor an eval — and the sigmoid is flat out there, so nothing
+        // downstream would notice. The solved reading is reported alone.
+        let solved_top = [(9, 100), (10, 120), (11, WIN_SCORE - 6)];
+        assert_eq!(smooth_ladder(&solved_top, 11, &[3, 2, 1]), Some(WIN_SCORE - 6));
+
+        // ...and a proof that appeared *below* the top ends the window there rather than being
+        // mixed in, leaving the evaluations above it to stand on their own.
+        let solved_below = [(9, WIN_SCORE - 8), (10, 120), (11, 220)];
+        assert_eq!(smooth_ladder(&solved_below, 11, &[3, 2, 1]), Some((220 * 3 + 120 * 2) / 5));
+    }
+
+    #[test]
+    fn averaging_rounds_away_from_zero_rather_than_toward_the_draw() {
+        // Truncation would pull every averaged reading a fraction of a cp toward 0, which over a
+        // whole game is a systematic bias toward "level" on exactly the balanced positions where the
+        // sigmoid is steepest and a cp costs the most win probability.
+        assert_eq!(smooth_ladder(&[(1, 1), (2, 2)], 2, &[1, 1]), Some(2)); // 1.5 -> 2
+        assert_eq!(smooth_ladder(&[(1, -1), (2, -2)], 2, &[1, 1]), Some(-2)); // -1.5 -> -2
     }
 
     #[test]

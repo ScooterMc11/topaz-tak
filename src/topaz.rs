@@ -221,7 +221,7 @@ pub fn main() {
             }
             return;
         } else if arg1 == "analyzegame" {
-            // Whole-game analysis for TakAnalyzerBot's /analyze sheet: per-ply evals + game stats,
+            // Whole-game analysis for Takana's /analyze sheet: per-ply evals + game stats,
             // printed as JSON. Plies come from --plies, --file (a PTN file), or trailing arguments.
             let mut opts = Options::new();
             opts.optopt("s", "size", "Board size: 4, 5 or 6 (default 6)", "N");
@@ -266,6 +266,11 @@ pub fn main() {
                 "alts-max-loss",
                 "Gate --alts to plies that gave up at most this many win percentage points",
                 "PCT",
+            );
+            opts.optflag(
+                "",
+                "depth-scores",
+                "Attach every completed iteration's score to each ply (diagnostic; costs nothing)",
             );
             opts.optflag("q", "quiet", "Suppress per-ply progress on stderr");
             opts.optflag("h", "help", "Print this help menu");
@@ -328,6 +333,7 @@ pub fn main() {
                 alts_max_loss_pct: matches
                     .opt_get_default("alts-max-loss", default.alts_max_loss_pct)
                     .unwrap(),
+                depth_scores: matches.opt_present("depth-scores"),
             };
             if let Err(e) = topaz_tak::analyze_game::run(cfg) {
                 eprintln!("analyzegame: {e}");
