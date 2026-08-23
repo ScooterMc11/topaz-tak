@@ -150,8 +150,8 @@
 //! How much of that gap is tolerated (`MAX_GRADE_DRIFT`) is the one number deciding how often a
 //! badge lands a grade away from what a deeper search would say, and it is set from measurement:
 //! below two win percentage points of drift the aligned grade is as good as either other method,
-//! above it the method comes apart while the sibling measurement does not. It fires on 13-26% of
-//! plies across the sample games, so most of the one-search-per-ply saving survives.
+//! above it the method comes apart while the sibling measurement does not. It fires on 2-19% of
+//! plies across the sample games (9.5% overall), so most of the one-search-per-ply saving survives.
 //!
 //! A ply whose *parent* the search solved is the other way alignment fails, and it fails silently.
 //! Solving stops the iteration, so the pair can come out at depth 2 — a proven win on one side and a
@@ -236,6 +236,10 @@ const MAX_GRADE_DRIFT: f64 = 2.0;
 /// | `[3, 2, 1]` | 0.98 | 0.70 | 20.4% |
 /// | `[1, 1, 1]` | 0.94 | — | 20.8% |
 /// | `[1, 1, 1, 1]` | 0.83 | 0.58 | 28.3% |
+///
+/// The regrade column is **as it was when this shipped**, with the guard reading the raw deepest
+/// score. It has since been put on this kernel's own footing, which halves it — see
+/// `distrust_aligned`. The comparison between rows still holds; the absolute numbers do not.
 ///
 /// The first column is the honest one: a ply the engine itself would have played is worth exactly
 /// what the position before it was worth, so the curve should not move across it at all, and every
@@ -1136,23 +1140,46 @@ fn sibling_endpoints(played_value: i32, alt: i32, played_best: bool) -> (i32, i3
 /// Should this aligned grade be thrown away and the ply re-measured against a sibling? See part 3 of
 /// the grading for what each arm is guarding against.
 ///
-/// `deepest_played` is the value of the position the ply reached at the deepest depth its own search
-/// completed. The aligned grade read that same position around `D-1`, so the two are readings of one
-/// position and are entitled to agree.
+/// `deepest_played` is the value of the position the ply reached, read at the deepest depth its own
+/// search completed and **through `DEPTH_KERNEL`, the same smoothing `g.played_value` carries**. The
+/// aligned grade read that same position around `D-1`, so the two are readings of one position on
+/// one footing, and are entitled to agree.
 ///
-/// **The two sides are deliberately on different footings.** `deepest_played` is the raw deepest
-/// reading; `g.played_value` is now smoothed across `DEPTH_KERNEL`, so a gap opens even where the
-/// ladder is perfectly well behaved and the guard fires more often: **18.1% of plies before depth
-/// averaging, 20.4% after** (measured over the four games in `DEPTH_KERNEL`'s table). Each firing is
-/// one extra sibling search, so that is the price.
+/// **What the matched footing gives up.** The pairing depth is `D = min(parent_deepest,
+/// child_deepest + 1)`, so whenever the parent searched deeper than the child, `D - 1` *is* the
+/// child's deepest and the two sides are literally the same number — drift 0, and no threshold can
+/// fire. That is **28.7% of plies**, where the only arms left are the solved ones. The raw footing
+/// this replaced did fire there, but on nothing the guard claims to measure: at equal depth the gap
+/// between the two sides is the smoothing offset, i.e. how far the last three iterations wobbled.
 ///
-/// Handing this the *smoothed* deepest reading instead would put both sides on one footing and drop
-/// the firing rate to **5.7%** — cheaper than before the change. That is not obviously the better
-/// trade, and it is not a tuning question: the guard's job is to notice when the pairing's reading is
-/// unreliable, and comparing a smoothed number against the same smoothing of the same position makes
-/// the two agree by construction. That is the shape of the blind spot documented in the module notes,
-/// where `drift_win_pct` returns 0 because both sides are the same number and no threshold can fire.
-/// If the firing rate ever needs to come down, change this call site rather than `MAX_GRADE_DRIFT`,
+/// **Measured, not reasoned** — 2026-08-22/23, 14 games / 1153 gradable plies at 200k nodes/ply
+/// against a 1.6M reference: the ten fixtures in `takana-dev/samples/accuracy/` plus the four games
+/// in `DEPTH_KERNEL`'s table. One `-g both --depth-scores` run per game grades every ply both ways,
+/// so any footing replays offline without a rebuild.
+///
+/// | footing | fires | searches saved | mean \|err\| vs the reference | band agreement |
+/// |---|---|---|---|---|
+/// | raw deepest (before) | 21.2% | — | 1.26 | 72.4% |
+/// | smoothed deepest (this) | 9.5% | 135, ~9.7% of wall time | 1.28 | 72.2% |
+/// | hybrid (below) | 11.6% | 111 | 1.27 | 72.3% |
+///
+/// 139 plies change which grade publishes and 53 change badge band, 30 harsher and 23 softer. The
+/// accuracy cost is a point estimate with the sign against this change and a confidence interval
+/// that spans zero: **+0.14 win points on the changed plies, 95% CI [-0.17, 0.46]**, band flips 20
+/// onto the reference's band and 23 off it, head-to-head 37 better / 45 worse / 57 tied. Everything
+/// there is inside the ~1.2-point per-ply noise floor, so this was chosen on cost and on the sheet
+/// agreeing with itself (bar-vs-badge 0.841 -> 0.799), not on accuracy.
+///
+/// **The hybrid, if the volatility signal is ever wanted back.** Pass the raw deepest reading where
+/// `D - 1 == child_deepest` and the smoothed one everywhere else — a condition at the call site,
+/// nothing here changes. It keeps 82% of the saving and today's behaviour on the plies where the
+/// guard still has teeth: on that blind subset the raw footing's firings have mean
+/// |aligned - sibling| 2.47 against 0.63 for the plies it passes, and the plies this change flips
+/// there do get worse (mean |err| 2.82 -> 3.28, band agreement 62.5% -> 54.2%, n=24, CI
+/// [-0.57, 1.59]). It also gives up almost all of the bar-vs-badge gain, which comes from those same
+/// volatile plies. The informative subset is a wash either way (1.55 -> 1.62).
+///
+/// If the firing rate ever needs to move again, change the call site rather than `MAX_GRADE_DRIFT`,
 /// and know which of the two you are buying.
 fn distrust_aligned(g: &Grade, deepest_played: i32) -> bool {
     // Nothing to trust: the method had no usable pair at all.
@@ -1637,8 +1664,8 @@ where
         // The sibling comparison does not depend on depth alignment at all, which makes it exactly
         // the right authority when alignment is the thing that failed. It costs the extra search
         // this method exists to avoid, and at the drift threshold this is tuned to it fires on
-        // 13-26% of plies across the sample games — the price of a grade that survives comparison
-        // with a deeper search.
+        // 2-19% of plies across the sample games, 9.5% overall — the price of a grade that survives
+        // comparison with a deeper search.
         //
         // What it does *not* do is put the two sides on one scale. Given its own full budget on one
         // position, the re-search can prove a win the parent's multi-PV search never came close to
@@ -1650,7 +1677,12 @@ where
         let mut aligned = aligned;
         let mut regraded = false;
         if cfg.grading == Grading::Aligned && terminal.is_none() {
-            let distrust = aligned.map_or(false, |g| distrust_aligned(&g, played_value));
+            // The position's own deepest reading, on the pairing's footing — smoothed through
+            // `DEPTH_KERNEL` like everything else the grade and the bar are made of. `played_value`
+            // above is the raw search score, which is the right number for the sibling comparison
+            // and the wrong one to hold a smoothed reading against; see `distrust_aligned`.
+            let deepest_played = -after.smoothed();
+            let distrust = aligned.map_or(false, |g| distrust_aligned(&g, deepest_played));
             if distrust {
                 if let Some(alt) = before.best_other_move(mv) {
                     board.reverse_move(rev_played);
