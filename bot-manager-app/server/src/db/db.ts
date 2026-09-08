@@ -6,14 +6,16 @@
 // game). 100k games ≈ 400 MB — comfortable for SQLite, and the (bot_name, started_at) and
 // (bot_name, config_hash) indices keep the two queries the UI makes O(log n).
 import Database from "better-sqlite3";
+import { gunzipSync } from "node:zlib";
 import { DB_PATH, DATA_DIR } from "./paths.js";
+import { countUndosAccepted } from "./undos.js";
 
 export type DB = Database.Database;
 
 let db: DB | null = null;
 
 // Bumped whenever the schema changes; `migrate` walks user_version up to this.
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS games (
@@ -69,12 +71,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_games_legacy
   ON games (bot_name, legacy_id) WHERE legacy_id IS NOT NULL;
 `;
 
+// v2 adds the per-game count of courtesy undos the opponent accepted. It's derived from the log at
+// insert time, so existing rows are backfilled from their stored logs once (see `migrate`).
+const SCHEMA_V2 = `
+ALTER TABLE games ADD COLUMN undos_accepted INTEGER NOT NULL DEFAULT 0;
+`;
+
 function migrate(conn: DB): void {
   const current = conn.pragma("user_version", { simple: true }) as number;
   if (current >= SCHEMA_VERSION) return;
   conn.exec("BEGIN");
   try {
     if (current < 1) conn.exec(SCHEMA_V1);
+    if (current < 2) {
+      conn.exec(SCHEMA_V2);
+      // Only games recorded since the courtesy-undo feature shipped can contain the marker, but the
+      // log is the only record of it, so scan them all once rather than guessing a cutoff.
+      const rows = conn
+        .prepare("SELECT id, log_gz FROM games WHERE log_gz IS NOT NULL")
+        .all() as { id: number; log_gz: Buffer }[];
+      const upd = conn.prepare("UPDATE games SET undos_accepted = ? WHERE id = ?");
+      let touched = 0;
+      for (const r of rows) {
+        let n = 0;
+        try {
+          n = countUndosAccepted(gunzipSync(r.log_gz).toString("utf8").split("\n"));
+        } catch {
+          continue; // a corrupt blob shouldn't block the migration
+        }
+        if (n > 0) {
+          upd.run(n, r.id);
+          touched++;
+        }
+      }
+      console.log(
+        `[bot-manager] backfilled undos_accepted on ${touched} of ${rows.length} logged games`
+      );
+    }
     conn.pragma(`user_version = ${SCHEMA_VERSION}`);
     conn.exec("COMMIT");
   } catch (e) {

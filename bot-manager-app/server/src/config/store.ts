@@ -43,13 +43,16 @@ export async function loadConfig(): Promise<AppConfig> {
   }
   // Schema migrations. Each step only ADDS a field, so patch it in-place and keep every calibrated
   // value: v3 -> v4 adds the alwaysAllow tunable (default 50), v4 -> v5 the offerUndos switch
-  // (default on). A config two steps behind walks both. Any other version gap (much older /
-  // future) falls back to a reseed rather than guessing. Local config only, so re-tuning is quick.
-  if (parsed.version === 3 || parsed.version === 4) {
+  // (default on), v5 -> v6 the per-bot undoOfferLimit (default null = unlimited). A config several
+  // steps behind walks them all. Any other version gap (much older / future) falls back to a
+  // reseed rather than guessing. Local config only, so re-tuning is quick.
+  if (parsed.version === 3 || parsed.version === 4 || parsed.version === 5) {
     const from = parsed.version;
     for (const b of parsed.bots ?? []) {
       if (from === 3 && b.tunables && b.tunables.alwaysAllow == null) b.tunables.alwaysAllow = 50;
       if (b.offerUndos == null) b.offerUndos = true;
+      // null is a meaningful value here (unlimited), so only fill in a genuinely absent field.
+      if (b.undoOfferLimit === undefined) b.undoOfferLimit = null;
     }
     parsed.version = CONFIG_VERSION;
     const errors = validateConfig(parsed);

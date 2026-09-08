@@ -1746,10 +1746,10 @@ struct PlaytakConfig {
     /// `search::select_gap`.
     always_allow: i32,
     /// Courtesy undo: how many times per game the bot may offer to take back an opponent move that
-    /// hung an instant road when a non-losing alternative existed (§ `should_offer_undo`). 0 = off,
-    /// which is the default so standalone / ladder launches never do this; the bot-manager passes
-    /// the real per-level cap (Novice 3 / Intermediate 2 / Advanced 1) and 0 when the switch is off.
-    undo_offers: u32,
+    /// hung an instant road when a non-losing alternative existed. **-1 = unlimited**, 0 = off,
+    /// N = at most N offers. 0 is the default so standalone / ladder launches never do this; the
+    /// bot-manager passes the per-bot value (and 0 when the switch is off).
+    undo_offers: i32,
 }
 
 impl PlaytakConfig {
@@ -1907,16 +1907,35 @@ struct PendingUndo {
     play_at: Option<Instant>,
 }
 
+/// Courtesy-undo offers remaining in a game, where `None` means unlimited. Built from the
+/// configured `undo_offers` (-1 = unlimited, 0 = off, N = a cap) at the start of every game.
+fn offers_for_game(undo_offers: i32) -> Option<u32> {
+    if undo_offers < 0 {
+        None
+    } else {
+        Some(undo_offers as u32)
+    }
+}
+
+/// Human-readable remaining-offers count for the per-move log.
+fn describe_offers(offers_left: Option<u32>) -> String {
+    match offers_left {
+        None => "unlimited offers".to_string(),
+        Some(1) => "1 offer".to_string(),
+        Some(n) => format!("{} offers", n),
+    }
+}
+
 /// How long to hold a courtesy undo open, or `None` to skip the offer and just play the win.
 ///
 /// The bot's clock runs while it waits — the server only refunds that time if the undo is actually
 /// accepted — so the wait is capped at the remaining time less a 30s cushion, and skipped outright
 /// with under a minute left. Politeness never costs a flag. An unknown clock (no `Time` line seen
-/// yet this game) is treated as "don't gamble".
-fn undo_wait(my_time_ms: Option<u64>, offers_left: u32) -> Option<std::time::Duration> {
+/// yet this game) is treated as "don't gamble". `offers_left` of `None` means unlimited.
+fn undo_wait(my_time_ms: Option<u64>, offers_left: Option<u32>) -> Option<std::time::Duration> {
     const MAX_WAIT: Duration = Duration::from_secs(60);
     const CUSHION: Duration = Duration::from_secs(30);
-    if offers_left == 0 {
+    if offers_left == Some(0) {
         return None;
     }
     let remaining = Duration::from_millis(my_time_ms?);
@@ -2078,7 +2097,7 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                 // rather than play. The cheap road check gates the expensive "did they have an
                 // out?" scan, and the search is skipped entirely on this path — which also keeps
                 // the clock cost of the offer itself down.
-                if config.undo_offers > 0 && !rev_cache.is_empty() {
+                if config.undo_offers != 0 && !rev_cache.is_empty() {
                     let mut storage = Vec::new();
                     if let Some(win) = board.can_make_road(&mut storage, None) {
                         let last = rev_cache[rev_cache.len() - 1];
@@ -2345,7 +2364,7 @@ fn playtak_loop(
             // Our own remaining clock in ms, from the `Timems`/`Time` line the server sends on
             // every turn change. Bounds how long an undo offer may be held open.
             let mut my_time_ms: Option<u64> = None;
-            let mut undo_offers_left = undo_offers;
+            let mut undo_offers_left = offers_for_game(undo_offers);
             let mut pending: Option<PendingUndo> = None;
             // Liveness watchdog: seconds since we last received ANY bytes from the server. A server
             // restart can leave the socket silent without a clean close (read_nonblocking just keeps
@@ -2456,7 +2475,7 @@ fn playtak_loop(
                                             moves.clear();
                                             opponent = None;
                                             my_time_ms = None;
-                                            undo_offers_left = undo_offers;
+                                            undo_offers_left = offers_for_game(undo_offers);
                                             pending = None;
                                         }
                                     } else {
@@ -2505,7 +2524,7 @@ fn playtak_loop(
                                         _ => None,
                                     };
                                     my_time_ms = None;
-                                    undo_offers_left = undo_offers;
+                                    undo_offers_left = offers_for_game(undo_offers);
                                     pending = None;
                                     playing = true;
                                     dbg!(&game_id);
@@ -2568,7 +2587,9 @@ fn playtak_loop(
                                             EngineReply::UndoOffer { win } => {
                                                 match undo_wait(my_time_ms, undo_offers_left) {
                                                     Some(wait) => {
-                                                        undo_offers_left -= 1;
+                                                        if let Some(n) = undo_offers_left.as_mut() {
+                                                            *n -= 1;
+                                                        }
                                                         let _ = com.write(
                                                             format!("Game#{} RequestUndo\n", id)
                                                                 .as_bytes(),
@@ -2588,10 +2609,10 @@ fn playtak_loop(
                                                             );
                                                         }
                                                         println!(
-                                                            "Courtesy undo offered: holding {} for {}s ({} offer(s) left this game)",
+                                                            "Courtesy undo offered: holding {} for {}s ({} left this game)",
                                                             win,
                                                             wait.as_secs(),
-                                                            undo_offers_left
+                                                            describe_offers(undo_offers_left)
                                                         );
                                                         pending = Some(PendingUndo {
                                                             win,
@@ -2602,8 +2623,8 @@ fn playtak_loop(
                                                     }
                                                     None => {
                                                         println!(
-                                                            "Courtesy undo skipped ({} offer(s) left, {:?} ms on our clock); playing {}",
-                                                            undo_offers_left, my_time_ms, win
+                                                            "Courtesy undo skipped ({} left, {:?} ms on our clock); playing {}",
+                                                            describe_offers(undo_offers_left), my_time_ms, win
                                                         );
                                                         send_playtak_move(
                                                             &mut com, &id, &win, size, &mut moves,
@@ -2721,13 +2742,27 @@ mod courtesy_undo_tests {
     #[test]
     fn the_wait_never_risks_a_flag() {
         // Plenty of clock: the full minute.
-        assert_eq!(undo_wait(Some(600_000), 2), Some(Duration::from_secs(60)));
+        assert_eq!(undo_wait(Some(600_000), Some(2)), Some(Duration::from_secs(60)));
         // Between one and one and a half minutes: whatever the 30s cushion leaves.
-        assert_eq!(undo_wait(Some(70_000), 2), Some(Duration::from_secs(40)));
+        assert_eq!(undo_wait(Some(70_000), Some(2)), Some(Duration::from_secs(40)));
         // Under a minute, out of offers, or no clock reading yet: don't offer at all.
-        assert_eq!(undo_wait(Some(45_000), 2), None);
-        assert_eq!(undo_wait(Some(600_000), 0), None);
-        assert_eq!(undo_wait(None, 2), None);
+        assert_eq!(undo_wait(Some(45_000), Some(2)), None);
+        assert_eq!(undo_wait(Some(600_000), Some(0)), None);
+        assert_eq!(undo_wait(None, Some(2)), None);
+        // Unlimited still respects the clock guard — it's a budget, not an override.
+        assert_eq!(undo_wait(Some(600_000), None), Some(Duration::from_secs(60)));
+        assert_eq!(undo_wait(Some(45_000), None), None);
+    }
+
+    /// -1 = unlimited, 0 = off, N = a per-game budget.
+    #[test]
+    fn offer_budget_encoding() {
+        assert_eq!(offers_for_game(-1), None);
+        assert_eq!(offers_for_game(0), Some(0));
+        assert_eq!(offers_for_game(3), Some(3));
+        // "off" must never offer, even with a full clock.
+        assert_eq!(undo_wait(Some(600_000), offers_for_game(0)), None);
+        assert!(undo_wait(Some(600_000), offers_for_game(-1)).is_some());
     }
 
     /// Every chat line must survive the server's ISO-8859-1 decode and its 256-character cap.

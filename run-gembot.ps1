@@ -53,8 +53,9 @@ param(
   # Courtesy undo: how many times per game the bot may offer to take back an opponent move that hung
   # an instant road while a non-losing alternative was available. It requests the undo, says so in
   # chat, and plays the winning move if the opponent says "gg" or goes quiet for a minute (the wait
-  # is capped by its own clock, so it can never flag over this). 0 = off, the default, so standalone
-  # / ladder launches are unaffected. The bot-manager passes the per-level cap.
+  # is capped by its own clock, so it can never flag over this). -1 = unlimited, 0 = off, N = at most
+  # N per game. 0 is the default so standalone / ladder launches are unaffected; the bot-manager
+  # passes the per-bot value.
   [int]$UndoOffers = 0,
   # Legacy softmax knob (superseded by EvalGap; kept for experiments). Higher => weaker.
   [int]$Temperature = 0,

@@ -59,6 +59,12 @@ function validateBot(errors: ValidationError[], b: BotConfig, idx: number): void
   if (typeof b.offerUndos !== "boolean") {
     errors.push({ path: `${p}.offerUndos`, message: "must be a boolean" });
   }
+  // null = unlimited; anything else must be a real count in range.
+  if (b.undoOfferLimit === undefined) {
+    errors.push({ path: `${p}.undoOfferLimit`, message: "must be a number or null" });
+  } else if (b.undoOfferLimit !== null) {
+    checkNum(errors, `${p}.undoOfferLimit`, b.undoOfferLimit, RANGES.undoOfferLimit);
+  }
 
   const t = b.tunables ?? ({} as BotConfig["tunables"]);
   if (!SEARCH_MODES.includes(t.searchMode)) {

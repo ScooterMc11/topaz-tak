@@ -42,21 +42,15 @@ export interface BotConfig {
   level: BotLevel; // fixed (grouping + size link)
   enabled: boolean;
   // Courtesy undo: offer to take back an opponent move that hung an instant road when they had a
-  // non-losing alternative. Deliberately NOT a tunable — it changes manners, not strength, so it
-  // stays out of the config hash and never splits a bot's ELO sample (see hash.ts).
+  // non-losing alternative. Deliberately NOT tunables — they change manners, not strength, so they
+  // stay out of the config hash and never split a bot's ELO sample (see hash.ts).
   offerUndos: boolean;
+  // How many such offers per game. null = unlimited (the default): a beginner who keeps hanging
+  // roads gets taken back every time rather than being cut off after the third.
+  undoOfferLimit: number | null;
   tunables: BotTunables;
   advanced: BotAdvanced;
 }
-
-// How many courtesy undos a bot offers per game, by level: the weaker the bot, the more likely its
-// opponent is a beginner who'd rather take the move back. Passed to the engine as -UndoOffers;
-// `offerUndos: false` sends 0 instead, which turns the behaviour off outright.
-export const UNDO_OFFERS_BY_LEVEL: Record<BotLevel, number> = {
-  Novice: 3,
-  Intermediate: 2,
-  Advanced: 1,
-};
 
 export interface GlobalConfig {
   serverHost: string;
@@ -73,7 +67,7 @@ export interface AppConfig {
   bots: BotConfig[];
 }
 
-export const CONFIG_VERSION = 5;
+export const CONFIG_VERSION = 6;
 
 // --- Field ranges (min/max/step). Consumed by validation and served to the frontend. ---
 export interface NumRange {
@@ -95,6 +89,8 @@ export const RANGES = {
   abortDepth: { min: 1, max: 6, step: 1, integer: true },
   time: { min: 60, max: 1200, step: 30, integer: true },
   hashMb: { min: 16, max: 512, step: 16, integer: true },
+  // Only consulted when a bot opts out of unlimited courtesy undos.
+  undoOfferLimit: { min: 1, max: 10, step: 1, integer: true },
 } as const satisfies Record<string, NumRange>;
 
 // The 6 bots are a fixed roster (identity = name + size + level). Only tunables/advanced/enabled edit.

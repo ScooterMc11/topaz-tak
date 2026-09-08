@@ -83,6 +83,9 @@ export default function GameLogPanel({ game, emptyText, selected }: GameLogPanel
               {game.opponentRating != null ? ` (${game.opponentRating})` : ""} · as{" "}
               {game.color ?? "?"} · {fmtResult(game.result)} · {fmtDateTime(game.startedAt)} ·{" "}
               {fmtDuration(game.startedAt, game.endedAt)}
+              {game.undosAccepted > 0
+                ? ` · ${game.undosAccepted} courtesy undo${game.undosAccepted === 1 ? "" : "s"} taken`
+                : ""}
             </Typography>
             {chips ? (
               <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>

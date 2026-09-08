@@ -35,6 +35,7 @@ function seedBot(name: string, size: BotSize, level: BotLevel): BotConfig {
     level,
     enabled: true,
     offerUndos: true,
+    undoOfferLimit: null, // unlimited
     tunables: {
       searchMode: "depth", // default to fixed-depth; switch per bot in the UI
       depth: DEPTH_BY_LEVEL[level],
