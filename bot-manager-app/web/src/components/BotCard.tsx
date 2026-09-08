@@ -34,6 +34,7 @@ import StopIcon from "@mui/icons-material/Stop";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SubjectIcon from "@mui/icons-material/Subject";
 import SliderRow from "./SliderRow";
+import { UNDO_OFFERS_BY_LEVEL } from "../types";
 import type { BotConfig, BotStatus, BotTunables, BotAdvanced, ConfigSchema, PriorityClass, SearchMode, NumRange } from "../types";
 
 interface BotCardProps {
@@ -45,6 +46,7 @@ interface BotCardProps {
   onTunables: (patch: Partial<BotTunables>) => void;
   onAdvanced: (patch: Partial<BotAdvanced>) => void;
   onEnabled: (enabled: boolean) => void;
+  onOfferUndos: (offerUndos: boolean) => void;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -99,6 +101,7 @@ export default function BotCard({
   onTunables,
   onAdvanced,
   onEnabled,
+  onOfferUndos,
   onStart,
   onStop,
   onRestart,
@@ -233,17 +236,32 @@ export default function BotCard({
       )}
       <Collapse in={!collapsed} timeout="auto" unmountOnExit>
       <CardContent sx={{ pt: 0 }}>
-        <FormControlLabel
-          control={
-            <Switch
-              size="small"
-              checked={bot.enabled}
-              onChange={(e) => onEnabled(e.target.checked)}
+        <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: 2, mb: 1 }}>
+          <FormControlLabel
+            control={
+              <Switch
+                size="small"
+                checked={bot.enabled}
+                onChange={(e) => onEnabled(e.target.checked)}
+              />
+            }
+            label="Enabled"
+          />
+          <Tooltip
+            title={`When an opponent hands this bot an instant road win that they could have avoided, it offers them the undo and says so in chat, then plays the win if they say "gg" or go quiet for a minute. ${UNDO_OFFERS_BY_LEVEL[bot.level]} offer${UNDO_OFFERS_BY_LEVEL[bot.level] === 1 ? "" : "s"} per game at ${bot.level} level. Does not affect the configuration the ELO plots group by.`}
+          >
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={bot.offerUndos}
+                  onChange={(e) => onOfferUndos(e.target.checked)}
+                />
+              }
+              label="Offer undos"
             />
-          }
-          label="Enabled"
-          sx={{ mb: 1 }}
-        />
+          </Tooltip>
+        </Box>
 
         <Box sx={{ mb: 1.5 }}>
           <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>

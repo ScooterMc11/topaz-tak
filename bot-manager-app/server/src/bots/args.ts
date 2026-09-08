@@ -1,7 +1,7 @@
 // Translate a bot's config + global settings into run-gembot.ps1 arguments — the same invocation
 // run-ladder.ps1 builds, so the proven launch logic is the single source of truth. Values are
 // passed as separate argv entries (no shell string), so there's no quoting/injection surface.
-import { AppConfig, BotConfig } from "../config/schema.js";
+import { AppConfig, BotConfig, UNDO_OFFERS_BY_LEVEL } from "../config/schema.js";
 
 // The UI works in a cp scale that's 1/4 of topaz's internal eval scale. Multiply the eval-gap
 // bounds by this when handing them to the engine so the UI can keep its human-friendly numbers.
@@ -33,6 +33,8 @@ export function buildGembotArgs(bot: BotConfig, global: AppConfig["global"]): st
     // Same 1/4 UI cp scale as the gap bounds: an always-allow floor of +50cp -> engine +200.
     "-AlwaysAllow", String(t.alwaysAllow * GAP_SCALE),
     "-MovePool", String(t.movePool),
+    // Courtesy undos: the per-level cap when the switch is on, 0 (= off) when it isn't.
+    "-UndoOffers", String(bot.offerUndos ? UNDO_OFFERS_BY_LEVEL[bot.level] : 0),
     "-ServerHost", global.serverHost,
     "-Port", String(global.port),
   ];

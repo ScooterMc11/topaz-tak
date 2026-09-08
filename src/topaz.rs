@@ -10,7 +10,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use telnet::Event;
 use topaz_tak::board::{Board5, Board6};
 use topaz_tak::eval::{Evaluator, Weights6, NNUE4, NNUE5, NNUE6};
@@ -1745,6 +1745,11 @@ struct PlaytakConfig {
     /// the pool; never overrides the decisive-best/near-loss guards. `i32::MAX` = disabled. See
     /// `search::select_gap`.
     always_allow: i32,
+    /// Courtesy undo: how many times per game the bot may offer to take back an opponent move that
+    /// hung an instant road when a non-losing alternative existed (§ `should_offer_undo`). 0 = off,
+    /// which is the default so standalone / ladder launches never do this; the bot-manager passes
+    /// the real per-level cap (Novice 3 / Intermediate 2 / Advanced 1) and 0 when the switch is off.
+    undo_offers: u32,
 }
 
 impl PlaytakConfig {
@@ -1835,6 +1840,9 @@ impl PlaytakConfig {
             always_allow: get("PLAYTAK_ALWAYS_ALLOW")
                 .and_then(|x| x.trim().parse().ok())
                 .unwrap_or(i32::MAX),
+            undo_offers: get("PLAYTAK_UNDO_OFFERS")
+                .and_then(|x| x.trim().parse().ok())
+                .unwrap_or(0),
         }
     }
 
@@ -1859,10 +1867,153 @@ impl PlaytakConfig {
     }
 }
 
+/// What the engine thread hands back to the telnet loop for one turn.
+#[derive(Debug, Clone)]
+enum EngineReply {
+    /// Play this move (PTN) now.
+    Move(String),
+    /// The opponent hung an instant road when they had a way out. Offer them the take-back first;
+    /// `win` is the road-completing move to play if they decline, say "gg", or go quiet.
+    UndoOffer { win: String },
+}
+
+/// Chat lines the bot cycles through when it offers a courtesy undo; one is picked at random per
+/// offer so a second offer in the same game doesn't read like a canned response.
+///
+/// PURE ASCII, deliberately: the server decodes client input as ISO-8859-1 (`Telnet.java`), so a
+/// UTF-8 em dash or curly quote would reach the opponent's chat as mojibake. Also stay under the
+/// server's 256-character `Tell` limit (the longest of these is ~175).
+const UNDO_OFFER_MESSAGES: [&str; 5] = [
+    "Watch out! That hangs a road. Feel free to undo, or just say \"gg\" and I'll take the win. If I don't hear back in a minute, I'll play it.",
+    "Careful - that gives me a road. I've offered an undo if you'd like the move back; otherwise say \"gg\" and I'll take it. I'll play on in a minute if you're away.",
+    "Heads up: I can finish a road right now. The undo's offered if you want it - or say \"gg\" and I'll play the winner. Otherwise I'll go ahead in a minute.",
+    "Oof - that one leaves me a road. No need to lose it like that: hit undo to take it back, or say \"gg\" and I'll take the win. I'll play in a minute if there's no reply.",
+    "Hold on - you've left me a road there. I've offered an undo; take it if you like, or say \"gg\" and I'll close it out. I'll play the road in a minute if I don't hear from you.",
+];
+
+/// A courtesy undo the bot has offered, holding the winning move behind it.
+#[derive(Debug)]
+struct PendingUndo {
+    /// The road-completing move to play once the offer lapses.
+    win: String,
+    /// When to stop waiting for the opponent (clock-capped; see `undo_wait`).
+    deadline: Instant,
+    /// The opponent waved us on in chat, so stop waiting at the next tick.
+    take_now: bool,
+    /// Set once `RemoveUndo` has gone out: play `win` at this instant. The gap gives a last-moment
+    /// acceptance time to arrive, and the main loop keeps parsing normally throughout — so if the
+    /// server does undo, `pending` is cleared and the move is never sent. `None` while the offer
+    /// is still open.
+    play_at: Option<Instant>,
+}
+
+/// How long to hold a courtesy undo open, or `None` to skip the offer and just play the win.
+///
+/// The bot's clock runs while it waits — the server only refunds that time if the undo is actually
+/// accepted — so the wait is capped at the remaining time less a 30s cushion, and skipped outright
+/// with under a minute left. Politeness never costs a flag. An unknown clock (no `Time` line seen
+/// yet this game) is treated as "don't gamble".
+fn undo_wait(my_time_ms: Option<u64>, offers_left: u32) -> Option<std::time::Duration> {
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+    const CUSHION: Duration = Duration::from_secs(30);
+    if offers_left == 0 {
+        return None;
+    }
+    let remaining = Duration::from_millis(my_time_ms?);
+    if remaining <= MAX_WAIT {
+        return None;
+    }
+    Some(MAX_WAIT.min(remaining - CUSHION))
+}
+
+/// Does an opponent chat line mean "don't bother, take the win"?
+///
+/// Word-boundary match so "gg" fires on "gg wp" but not on "egg". Punctuation is flattened to
+/// spaces first, which also makes "gg!" and "go ahead." match.
+fn is_take_the_win(text: &str) -> bool {
+    let flattened: String = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    let padded = format!(" {} ", flattened.split_whitespace().collect::<Vec<_>>().join(" "));
+    ["gg", "ggs", "gh", "take it", "go ahead", "no thanks"]
+        .iter()
+        .any(|phrase| padded.contains(&format!(" {} ", phrase)))
+}
+
+/// Send one PTN move as this game's next ply and record it locally.
+///
+/// The server echoes a move only to the OTHER player, so our own move list has to be appended here
+/// or the side-to-move parity (and the position we hand the engine) goes wrong.
+fn send_playtak_move(
+    com: &mut telnet::Telnet,
+    game_id: &str,
+    ptn: &str,
+    size: usize,
+    moves: &mut Vec<String>,
+) {
+    let color = if moves.len() % 2 == 0 {
+        Color::White
+    } else {
+        Color::Black
+    };
+    let m = GameMove::try_from_ptn_m(ptn, size, color).unwrap();
+    let playtak_m = if size == 5 {
+        m.to_playtak::<Board5>()
+    } else {
+        m.to_playtak::<Board6>()
+    };
+    let message = format!("Game#{} {}\n", game_id, playtak_m);
+    println!("Sending: {}", message);
+    let _ = com.write(message.as_bytes());
+    moves.push(playtak_m);
+}
+
+/// Did the opponent have a way out, or was the loss forced?
+///
+/// `board` is the position AFTER their move (the bot to play) and `last` the reverse handle for
+/// that move. Returns true iff at least one of their legal alternatives does NOT hand the bot an
+/// immediate road — i.e. the move they actually played was a careless instant loss rather than a
+/// forced one. A move that would have ended the game in their favour counts as a way out too, so a
+/// missed win never reads as "forced".
+///
+/// This is the shallow definition on purpose: dodging the road but losing to a mate-in-3 still
+/// counts as an out. We're identifying the careless blunder, not adjudicating the position. The
+/// board is left exactly as it was found.
+///
+/// Only ever called once the bot is known to have a road win, which means the opponent was under a
+/// road threat — so a blocking move is usually found within the first handful of candidates.
+fn opponent_had_an_out<B: TakBoard>(board: &mut B, last: RevGameMove) -> bool {
+    let opponent = !board.side_to_move();
+    board.reverse_move(last);
+    let mut candidates = Vec::new();
+    generate_all_moves(board, &mut candidates);
+    let mut storage = Vec::new();
+    let mut found = false;
+    for m in candidates {
+        let rev = board.do_move(m);
+        found = match board.game_result() {
+            // Their move ended the game outright (their road, or a flat count): an out unless it
+            // ended by handing us the win, which is no better than the road they actually hung.
+            Some(res) => res != GameResult::win_by(!opponent),
+            // Game continues: an out iff it denies us the immediate road.
+            None => board.can_make_road(&mut storage, None).is_none(),
+        };
+        board.reverse_move(rev);
+        storage.clear();
+        if found {
+            break;
+        }
+    }
+    board.do_move(last.game_move);
+    found
+}
+
 /// Engine side of the PlayTak client, generic over board size (`E::Game` is `Board5`/`Board6`).
 /// Dispatched from `main` by `PLAYTAK_SIZE` (`play_game_playtak::<NNUE5>` / `::<NNUE6>`).
 fn play_game_playtak<E: Evaluator + Default + Send>(
-    server_send: Sender<String>,
+    server_send: Sender<EngineReply>,
     server_recv: Receiver<TeiCommand>,
     config: PlaytakConfig,
 ) -> Result<()> {
@@ -1871,6 +2022,9 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
     let komi = config.komi;
     let weights = config.black_opening_weights.clone();
     let mut move_cache: Vec<GameMove> = Vec::new();
+    // Reverse handles for `move_cache`, so the courtesy-undo check can step one ply back to the
+    // position the opponent moved from without replaying the game.
+    let mut rev_cache: Vec<RevGameMove> = Vec::new();
     let mut board = E::Game::start_position().with_komi(komi);
     let table = HashTable::new(config.hash_mb * 1024 * 1024);
     let mut eval = E::default();
@@ -1896,7 +2050,7 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                     };
                     if let Some(black_sq) = reply {
                         println!("Black archetype reply to {}: {}", w_sq, black_sq);
-                        server_send.send(black_sq).unwrap();
+                        server_send.send(EngineReply::Move(black_sq)).unwrap();
                         continue 'outer;
                     }
                 }
@@ -1916,8 +2070,33 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                     let idx = (rand_core::RngCore::next_u32(&mut rng) as usize) % corners.len();
                     let mv = format!("2{}", corners[idx]);
                     println!("White opening: forcing double black stack to corner {}", corners[idx]);
-                    server_send.send(mv).unwrap();
+                    server_send.send(EngineReply::Move(mv)).unwrap();
                     continue 'outer;
+                }
+                // Courtesy undo (PLAYTAK_UNDO_OFFERS): the opponent just handed us an instant road
+                // when they had a way out. Give the telnet loop the winning move to OFFER back
+                // rather than play. The cheap road check gates the expensive "did they have an
+                // out?" scan, and the search is skipped entirely on this path — which also keeps
+                // the clock cost of the offer itself down.
+                if config.undo_offers > 0 && !rev_cache.is_empty() {
+                    let mut storage = Vec::new();
+                    if let Some(win) = board.can_make_road(&mut storage, None) {
+                        let last = rev_cache[rev_cache.len() - 1];
+                        if opponent_had_an_out(&mut board, last) {
+                            let win_ptn = win.to_ptn::<E::Game>();
+                            let stm = if board.side_to_move() == Color::White { "White" } else { "Black" };
+                            // Same MOVE banner the search path prints: it keeps the log readable and
+                            // it's what the bot-manager counts to get a game's move count.
+                            println!("========== MOVE {} ({} to play) ==========", board.move_num(), stm);
+                            println!("mode: courtesy undo | opponent hung an instant road and had a non-losing alternative");
+                            println!("CHOSEN: {}  [road win, offering the undo first]", win_ptn);
+                            println!();
+                            server_send
+                                .send(EngineReply::UndoOffer { win: win_ptn })
+                                .unwrap();
+                            continue 'outer;
+                        }
+                    }
                 }
                 // Node-capped search (the strength knob). The flat time bank is a safety net so the
                 // bot never flags; with a low node cap moves finish well within it. Tracking the
@@ -2069,13 +2248,14 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                         println!();
                     }
 
-                    server_send.send(chosen).unwrap();
+                    server_send.send(EngineReply::Move(chosen)).unwrap();
                 } else {
                     println!("Something went wrong, search failed!");
                 }
             }
             TeiCommand::Position(s) => {
                 move_cache.clear();
+                rev_cache.clear();
                 board = E::Game::start_position().with_komi(komi);
                 for m in s.split(',') {
                     if let Some(mut m) = GameMove::try_from_playtak(m, &board) {
@@ -2100,7 +2280,7 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                             }
                         }
                         move_cache.push(m);
-                        board.do_move(m);
+                        rev_cache.push(board.do_move(m));
                     }
                 }
             }
@@ -2111,6 +2291,7 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                 table.clear();
                 board = E::Game::start_position().with_komi(komi);
                 move_cache = Vec::new();
+                rev_cache = Vec::new();
             }
             _ => println!("Unknown command: {:?}", message),
         }
@@ -2120,7 +2301,7 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
 
 fn playtak_loop(
     engine_send: Sender<TeiCommand>,
-    engine_recv: Receiver<String>,
+    engine_recv: Receiver<EngineReply>,
     config: PlaytakConfig,
 ) {
     let login_s = match (config.username.clone(), config.password.clone()) {
@@ -2131,7 +2312,10 @@ fn playtak_loop(
     let host = config.host.clone();
     let port = config.port;
     let size = config.size;
+    let undo_offers = config.undo_offers;
     std::thread::spawn(move || {
+        // Only used to vary the courtesy-undo chat line, so any source of noise will do.
+        let mut rng = topaz_tak::datagen::new_rng();
         // Outer reconnect loop: a dropped/errored telnet connection reconnects and re-seeks rather
         // than killing the process (so a transient blip never abandons future games). Keep-alive
         // across process exits is still the job of an external restart wrapper (§6.5).
@@ -2155,12 +2339,52 @@ fn playtak_loop(
             let mut goal: Option<String> = None;
             let mut live_seek = false;
             let mut moves: Vec<String> = Vec::new();
+            // --- Courtesy undo state (all per-game; reset on Game Start and on game end) ---
+            // The opponent's account name, exact case, for `Tell`.
+            let mut opponent: Option<String> = None;
+            // Our own remaining clock in ms, from the `Timems`/`Time` line the server sends on
+            // every turn change. Bounds how long an undo offer may be held open.
+            let mut my_time_ms: Option<u64> = None;
+            let mut undo_offers_left = undo_offers;
+            let mut pending: Option<PendingUndo> = None;
             // Liveness watchdog: seconds since we last received ANY bytes from the server. A server
             // restart can leave the socket silent without a clean close (read_nonblocking just keeps
             // returning NoData), so the outer reconnect loop would never fire. We ping every 30s and
             // the server answers, so >~2 ping cycles of total silence means the connection is dead.
             let mut silence = 0;
             loop {
+                // A courtesy undo in flight resolves here, before anything else, in two steps:
+                // first withdraw our own request, then (a beat later) play the held road win. The
+                // withdrawal closes the accept-vs-play race — once it lands, a click from the
+                // opponent registers as a NEW request of their own rather than an acceptance of
+                // ours, so the server can never rewind the board out from under our move. If they
+                // did get in first, the `Undo` line clears `pending` during the gap and the move is
+                // never sent.
+                if let Some(p) = pending.as_mut() {
+                    let now = Instant::now();
+                    match p.play_at {
+                        None if p.take_now || now >= p.deadline => {
+                            println!(
+                                "Courtesy undo lapsed ({}); withdrawing the offer and playing {}",
+                                if p.take_now { "waved on" } else { "timed out" },
+                                p.win
+                            );
+                            if let Some(ref id) = game_id {
+                                let _ = com.write(format!("Game#{} RemoveUndo\n", id).as_bytes());
+                            }
+                            p.play_at = Some(now + Duration::from_secs(1));
+                        }
+                        Some(at) if now >= at => {
+                            let win = p.win.clone();
+                            pending = None;
+                            if let Some(ref id) = game_id {
+                                send_playtak_move(&mut com, id, &win, size, &mut moves);
+                            }
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                        _ => {}
+                    }
+                }
                 match com.read_nonblocking() {
                     Ok(event) => match event {
                         Event::Data(buffer) => {
@@ -2180,10 +2404,37 @@ fn playtak_loop(
                                     let _ = com.write(b"Protocol 4\n");
                                     let _ = com.write(login_s.as_bytes());
                                 } else if line.starts_with("Game#") {
-                                    let rest = line.split_once(' ').map(|x| x.1);
+                                    let rest = line.split_once(' ').map(|x| x.1.trim_end());
                                     if let Some(rest) = rest {
                                         if rest.starts_with('P') || rest.starts_with('M') {
                                             moves.push(rest.to_string());
+                                        } else if rest == "Undo" {
+                                            // Both sides have now requested an undo, so the server
+                                            // popped exactly one ply — the opponent's, since it was
+                                            // our turn. Drop it here too and hand the turn back;
+                                            // any move we were holding behind an offer dies with it.
+                                            moves.pop();
+                                            pending = None;
+                                            waiting_for_engine = false;
+                                            println!("Undo accepted: last move rolled back");
+                                        } else if rest.starts_with("Timems ")
+                                            || rest.starts_with("Time ")
+                                        {
+                                            // "Timems <whiteMs> <blackMs>" at protocol >= 1, else
+                                            // "Time <whiteSec> <blackSec>". Sent on every turn
+                                            // change, so our clock is fresh whenever it's our move.
+                                            let scale =
+                                                if rest.starts_with("Timems") { 1 } else { 1000 };
+                                            let mut nums = rest
+                                                .split_whitespace()
+                                                .skip(1)
+                                                .filter_map(|x| x.parse::<u64>().ok());
+                                            if let (Some(w), Some(b), Some(color)) =
+                                                (nums.next(), nums.next(), my_color.as_deref())
+                                            {
+                                                let mine = if color == "white" { w } else { b };
+                                                my_time_ms = Some(mine * scale);
+                                            }
                                         } else if rest.starts_with("Over")
                                             || rest.starts_with("Abandoned")
                                         {
@@ -2203,9 +2454,30 @@ fn playtak_loop(
                                             goal = None;
                                             live_seek = false;
                                             moves.clear();
+                                            opponent = None;
+                                            my_time_ms = None;
+                                            undo_offers_left = undo_offers;
+                                            pending = None;
                                         }
                                     } else {
                                         dbg!(line);
+                                    }
+                                } else if line.starts_with("Tell <") {
+                                    // In-game chat between two players is a private Tell, not a
+                                    // room: "Tell <Name> message". The only thing we act on is the
+                                    // opponent waving us on past a courtesy undo.
+                                    let said = line
+                                        .trim_end()
+                                        .strip_prefix("Tell <")
+                                        .and_then(|r| r.split_once("> "));
+                                    if let (Some((from, text)), Some(p)) = (said, pending.as_mut()) {
+                                        let from_opponent = opponent
+                                            .as_deref()
+                                            .is_some_and(|o| o.eq_ignore_ascii_case(from));
+                                        if from_opponent && is_take_the_win(text) {
+                                            println!("{} said \"{}\": taking the win", from, text);
+                                            p.take_now = true;
+                                        }
                                     }
                                 } else if line.starts_with("Seek new") {
                                     if line.contains(opp) {
@@ -2223,9 +2495,22 @@ fn playtak_loop(
                                     // protocol < 2, which is what the old hardcoded nth(7) assumed).
                                     my_color =
                                         line.split_whitespace().nth(6).map(|x| x.to_lowercase());
+                                    // "... <no> <white> vs <black> <color> ...": the opponent is
+                                    // whichever of the two we aren't. Kept exact-case because
+                                    // `Tell` looks the account name up verbatim.
+                                    let t: Vec<&str> = line.split_whitespace().collect();
+                                    opponent = match my_color.as_deref() {
+                                        Some("white") => t.get(5).map(|x| x.to_string()),
+                                        Some("black") => t.get(3).map(|x| x.to_string()),
+                                        _ => None,
+                                    };
+                                    my_time_ms = None;
+                                    undo_offers_left = undo_offers;
+                                    pending = None;
                                     playing = true;
                                     dbg!(&game_id);
                                     dbg!(&my_color);
+                                    dbg!(&opponent);
                                     opp = "NONE";
                                 }
                             }
@@ -2265,33 +2550,76 @@ fn playtak_loop(
                                     _ => panic!("Weird color?"),
                                 };
                                 if waiting_for_engine {
-                                    if let Ok(response) = engine_recv.try_recv() {
-                                        let color = if moves.len() % 2 == 0 {
-                                            Color::White
-                                        } else {
-                                            Color::Black
-                                        };
-                                        let m = GameMove::try_from_ptn_m(&response, size, color)
-                                            .unwrap();
-                                        let playtak_m = if size == 5 {
-                                            m.to_playtak::<Board5>()
-                                        } else {
-                                            m.to_playtak::<Board6>()
-                                        };
-                                        let message = format!(
-                                            "Game#{} {}\n",
-                                            game_id.as_ref().unwrap(),
-                                            playtak_m
-                                        );
-                                        println!("Sending: {}", message);
-                                        let _ = com.write(message.as_bytes());
+                                    if let Ok(reply) = engine_recv.try_recv() {
                                         waiting_for_engine = false;
-                                        moves.push(playtak_m);
-                                        thread::sleep(std::time::Duration::from_secs(1));
+                                        let id = game_id.clone().unwrap();
+                                        match reply {
+                                            EngineReply::Move(ptn) => {
+                                                send_playtak_move(
+                                                    &mut com, &id, &ptn, size, &mut moves,
+                                                );
+                                                thread::sleep(Duration::from_secs(1));
+                                            }
+                                            // The opponent hung an instant road when they had a way
+                                            // out. Offer the take-back and sit on the winning move
+                                            // — unless we're out of offers for this game or too
+                                            // short on clock to afford the wait, in which case just
+                                            // play it as usual.
+                                            EngineReply::UndoOffer { win } => {
+                                                match undo_wait(my_time_ms, undo_offers_left) {
+                                                    Some(wait) => {
+                                                        undo_offers_left -= 1;
+                                                        let _ = com.write(
+                                                            format!("Game#{} RequestUndo\n", id)
+                                                                .as_bytes(),
+                                                        );
+                                                        if let Some(name) = opponent.as_deref() {
+                                                            let i = rand_core::RngCore::next_u32(
+                                                                &mut rng,
+                                                            )
+                                                                as usize
+                                                                % UNDO_OFFER_MESSAGES.len();
+                                                            let _ = com.write(
+                                                                format!(
+                                                                    "Tell {} {}\n",
+                                                                    name, UNDO_OFFER_MESSAGES[i]
+                                                                )
+                                                                .as_bytes(),
+                                                            );
+                                                        }
+                                                        println!(
+                                                            "Courtesy undo offered: holding {} for {}s ({} offer(s) left this game)",
+                                                            win,
+                                                            wait.as_secs(),
+                                                            undo_offers_left
+                                                        );
+                                                        pending = Some(PendingUndo {
+                                                            win,
+                                                            deadline: Instant::now() + wait,
+                                                            take_now: false,
+                                                            play_at: None,
+                                                        });
+                                                    }
+                                                    None => {
+                                                        println!(
+                                                            "Courtesy undo skipped ({} offer(s) left, {:?} ms on our clock); playing {}",
+                                                            undo_offers_left, my_time_ms, win
+                                                        );
+                                                        send_playtak_move(
+                                                            &mut com, &id, &win, size, &mut moves,
+                                                        );
+                                                        thread::sleep(Duration::from_secs(1));
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     continue;
                                 }
-                                if my_turn {
+                                // An offer in flight owns the turn until it resolves at the top of
+                                // the loop; without this the bot would start a fresh search on the
+                                // very next tick and move on top of its own offer.
+                                if my_turn && pending.is_none() {
                                     let _ = engine_send
                                         .send(TeiCommand::Position(moves.join(",")));
                                     let _ = engine_send.send(TeiCommand::Go(TeiGo::default()));
@@ -2326,3 +2654,90 @@ fn playtak_loop(
 //     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::from_seed(seed);
 //     topaz_tak::move_gen::magic::generate_move_magic6(&mut rng);
 // }
+
+#[cfg(test)]
+mod courtesy_undo_tests {
+    use super::*;
+    use topaz_tak::board::Board6;
+
+    /// Play one PTN move and hand back the reverse handle, the way the Position handler does.
+    fn play(board: &mut Board6, ptn: &str) -> RevGameMove {
+        let m = GameMove::try_from_ptn(ptn, board).expect("bad test ptn");
+        board.do_move(m)
+    }
+
+    /// White owns row 1 bar f1, so a placement there is an instant road. Black is under that
+    /// threat with an obvious block available.
+    const ONE_THREAT: &str = "x6/x6/x6/2,2,2,x3/x6/1,1,1,1,1,x 2 5";
+    /// Two independent white road threats (f1 and f2). Black can only ever block one.
+    const TWO_THREATS: &str = "x6/x6/x6/x6/1,1,1,1,1,x/1,1,1,1,1,x 2 6";
+
+    #[test]
+    fn careless_hang_is_an_offer() {
+        let mut board = Board6::try_from_tps(ONE_THREAT).unwrap();
+        let rev = play(&mut board, "d3"); // extends black's own row instead of blocking f1
+        assert!(board.can_make_road(&mut Vec::new(), None).is_some());
+        assert!(opponent_had_an_out(&mut board, rev));
+    }
+
+    #[test]
+    fn forced_loss_is_not_an_offer() {
+        let mut board = Board6::try_from_tps(TWO_THREATS).unwrap();
+        let rev = play(&mut board, "f1"); // blocks one threat; f2 still roads
+        assert!(board.can_make_road(&mut Vec::new(), None).is_some());
+        assert!(!opponent_had_an_out(&mut board, rev));
+    }
+
+    /// A wall counts as a block: the same position is a blunder only because the block existed.
+    #[test]
+    fn blocking_move_leaves_no_road() {
+        let mut board = Board6::try_from_tps(ONE_THREAT).unwrap();
+        play(&mut board, "Sf1");
+        assert!(board.can_make_road(&mut Vec::new(), None).is_none());
+    }
+
+    /// The scan walks the whole move list on a board the caller keeps using, so it has to put
+    /// everything back exactly as it found it.
+    #[test]
+    fn scan_restores_the_board() {
+        let mut board = Board6::try_from_tps(ONE_THREAT).unwrap();
+        let rev = play(&mut board, "d3");
+        let before = board.clone();
+        opponent_had_an_out(&mut board, rev);
+        assert_eq!(board, before);
+        assert_eq!(board.zobrist(), before.zobrist());
+    }
+
+    #[test]
+    fn gg_phrases_are_recognized() {
+        for yes in ["gg", "GG", "gg wp", "gg!", "Take it", "go ahead :)", "no thanks"] {
+            assert!(is_take_the_win(yes), "expected {:?} to end the wait", yes);
+        }
+        for no in ["one sec", "thanks!", "egg", "aggravating", "hmm", "how do I undo?"] {
+            assert!(!is_take_the_win(no), "expected {:?} to be ignored", no);
+        }
+    }
+
+    #[test]
+    fn the_wait_never_risks_a_flag() {
+        // Plenty of clock: the full minute.
+        assert_eq!(undo_wait(Some(600_000), 2), Some(Duration::from_secs(60)));
+        // Between one and one and a half minutes: whatever the 30s cushion leaves.
+        assert_eq!(undo_wait(Some(70_000), 2), Some(Duration::from_secs(40)));
+        // Under a minute, out of offers, or no clock reading yet: don't offer at all.
+        assert_eq!(undo_wait(Some(45_000), 2), None);
+        assert_eq!(undo_wait(Some(600_000), 0), None);
+        assert_eq!(undo_wait(None, 2), None);
+    }
+
+    /// Every chat line must survive the server's ISO-8859-1 decode and its 256-character cap.
+    #[test]
+    fn offer_messages_are_wire_safe() {
+        for msg in UNDO_OFFER_MESSAGES {
+            assert!(msg.is_ascii(), "non-ascii in {:?}", msg);
+            assert!(msg.len() <= 256, "too long: {:?}", msg);
+            assert!(!msg.contains('\n') && !msg.contains('\r'));
+        }
+    }
+}
+

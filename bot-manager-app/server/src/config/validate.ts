@@ -56,6 +56,9 @@ function validateBot(errors: ValidationError[], b: BotConfig, idx: number): void
   if (typeof b.enabled !== "boolean") {
     errors.push({ path: `${p}.enabled`, message: "must be a boolean" });
   }
+  if (typeof b.offerUndos !== "boolean") {
+    errors.push({ path: `${p}.offerUndos`, message: "must be a boolean" });
+  }
 
   const t = b.tunables ?? ({} as BotConfig["tunables"]);
   if (!SEARCH_MODES.includes(t.searchMode)) {
