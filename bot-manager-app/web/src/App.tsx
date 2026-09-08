@@ -227,6 +227,14 @@ export default function App() {
     );
   }
 
+  function updateBotUndoOfferLimit(name: string, undoOfferLimit: number | null) {
+    setDraft((prev) =>
+      prev
+        ? { ...prev, bots: prev.bots.map((b) => (b.name === name ? { ...b, undoOfferLimit } : b)) }
+        : prev
+    );
+  }
+
   function revert() {
     if (baseline) setDraft(structuredClone(baseline));
   }
@@ -433,6 +441,7 @@ export default function App() {
                         onAdvanced={(p) => updateBotAdvanced(bot.name, p)}
                         onEnabled={(v) => updateBotEnabled(bot.name, v)}
                         onOfferUndos={(v) => updateBotOfferUndos(bot.name, v)}
+                        onUndoOfferLimit={(v) => updateBotUndoOfferLimit(bot.name, v)}
                         onStart={() => runAction(() => api.startBot(bot.name), `Start ${bot.name}`)}
                         onStop={() => runAction(() => api.stopBot(bot.name), `Stop ${bot.name}`)}
                         onRestart={() =>

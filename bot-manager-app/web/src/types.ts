@@ -7,13 +7,9 @@ export type PriorityClass = "Idle" | "BelowNormal" | "Normal" | "AboveNormal" | 
 
 export type SearchMode = "depth" | "nodes";
 
-// Mirrors the server's UNDO_OFFERS_BY_LEVEL: how many courtesy undos a bot offers per game. Shown
-// in the "Offer undos" tooltip so the card says what the switch actually buys.
-export const UNDO_OFFERS_BY_LEVEL: Record<BotLevel, number> = {
-  Novice: 3,
-  Intermediate: 2,
-  Advanced: 1,
-};
+// Default per-game courtesy-undo budget when a bot opts into a limit. Unlimited (null) is the
+// normal setting; this is only the starting value the slider reveals.
+export const UNDO_OFFERS_DEFAULT_LIMIT = 3;
 
 export interface BotTunables {
   searchMode: SearchMode;
@@ -39,9 +35,11 @@ export interface BotConfig {
   size: BotSize;
   level: BotLevel;
   enabled: boolean;
-  // Courtesy undo: offer to take back an opponent move that hung an instant road. Not a tunable —
-  // it's excluded from the config hash, so toggling it never splits a bot's ELO sample.
+  // Courtesy undo: offer to take back an opponent move that hung an instant road. Not tunables —
+  // both are excluded from the config hash, so changing them never splits a bot's ELO sample.
   offerUndos: boolean;
+  // How many such offers per game. null = unlimited (the default).
+  undoOfferLimit: number | null;
   tunables: BotTunables;
   advanced: BotAdvanced;
 }
@@ -88,6 +86,7 @@ export interface ConfigSchema {
     abortDepth: NumRange;
     time: NumRange;
     hashMb: NumRange;
+    undoOfferLimit: NumRange;
   };
   roster: { name: string; size: BotSize; level: BotLevel }[];
   priorities: PriorityClass[];
@@ -140,6 +139,9 @@ export interface GameSummary {
   startedAt: number;
   endedAt: number;
   moveCount: number;
+  // Courtesy undos the opponent actually accepted this game (0 for games played before the
+  // feature, and for bots with it switched off).
+  undosAccepted: number;
   boardSize: number | null;
   rated: boolean | null;
   ratingsState: "pending" | "ok" | "unavailable";

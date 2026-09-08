@@ -34,7 +34,7 @@ import StopIcon from "@mui/icons-material/Stop";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SubjectIcon from "@mui/icons-material/Subject";
 import SliderRow from "./SliderRow";
-import { UNDO_OFFERS_BY_LEVEL } from "../types";
+import { UNDO_OFFERS_DEFAULT_LIMIT } from "../types";
 import type { BotConfig, BotStatus, BotTunables, BotAdvanced, ConfigSchema, PriorityClass, SearchMode, NumRange } from "../types";
 
 interface BotCardProps {
@@ -47,6 +47,7 @@ interface BotCardProps {
   onAdvanced: (patch: Partial<BotAdvanced>) => void;
   onEnabled: (enabled: boolean) => void;
   onOfferUndos: (offerUndos: boolean) => void;
+  onUndoOfferLimit: (limit: number | null) => void;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -102,6 +103,7 @@ export default function BotCard({
   onAdvanced,
   onEnabled,
   onOfferUndos,
+  onUndoOfferLimit,
   onStart,
   onStop,
   onRestart,
@@ -248,7 +250,7 @@ export default function BotCard({
             label="Enabled"
           />
           <Tooltip
-            title={`When an opponent hands this bot an instant road win that they could have avoided, it offers them the undo and says so in chat, then plays the win if they say "gg" or go quiet for a minute. ${UNDO_OFFERS_BY_LEVEL[bot.level]} offer${UNDO_OFFERS_BY_LEVEL[bot.level] === 1 ? "" : "s"} per game at ${bot.level} level. Does not affect the configuration the ELO plots group by.`}
+            title={'When an opponent hands this bot an instant road win that they could have avoided, it offers them the undo and says so in chat, then plays the win if they say "gg" or go quiet for a minute. Does not affect the configuration the ELO plots group by.'}
           >
             <FormControlLabel
               control={
@@ -262,6 +264,37 @@ export default function BotCard({
             />
           </Tooltip>
         </Box>
+
+        {/* Only meaningful while the switch is on. Off = unlimited, which is the default. */}
+        {bot.offerUndos && (
+          <Box sx={{ mb: 1.5 }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={bot.undoOfferLimit != null}
+                  onChange={(e) =>
+                    onUndoOfferLimit(e.target.checked ? UNDO_OFFERS_DEFAULT_LIMIT : null)
+                  }
+                />
+              }
+              label={
+                <Typography variant="body2" color="text.secondary">
+                  Limit undos per game {bot.undoOfferLimit == null ? "— unlimited" : ""}
+                </Typography>
+              }
+            />
+            {bot.undoOfferLimit != null && (
+              <SliderRow
+                label="Undos per game"
+                value={bot.undoOfferLimit}
+                range={r.undoOfferLimit}
+                helper="After this many accepted-or-declined offers, the bot just plays the win"
+                onChange={(v) => onUndoOfferLimit(v as number)}
+              />
+            )}
+          </Box>
+        )}
 
         <Box sx={{ mb: 1.5 }}>
           <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>

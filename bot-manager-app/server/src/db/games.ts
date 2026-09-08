@@ -3,6 +3,7 @@
 // pruned — the UI just asks for the newest N.
 import { gzipSync, gunzipSync } from "node:zlib";
 import { getDb } from "./db.js";
+import { countUndosAccepted } from "./undos.js";
 import type { ConfigSnapshot } from "../config/hash.js";
 
 export interface GameSummary {
@@ -18,6 +19,9 @@ export interface GameSummary {
   startedAt: number;
   endedAt: number;
   moveCount: number;
+  // Courtesy undos the opponent accepted this game. Counted from the log, so it's 0 for games
+  // played before the feature and for bots with it switched off.
+  undosAccepted: number;
   boardSize: number | null;
   rated: boolean | null;
   ratingsState: "pending" | "ok" | "unavailable";
@@ -60,6 +64,7 @@ interface GameRow {
   started_at: number;
   ended_at: number;
   move_count: number;
+  undos_accepted: number;
   board_size: number | null;
   server_host: string | null;
   server_port: number | null;
@@ -124,6 +129,7 @@ function toSummary(r: GameRow): GameSummary {
     startedAt: r.started_at,
     endedAt: r.ended_at,
     moveCount: r.move_count,
+    undosAccepted: r.undos_accepted ?? 0,
     boardSize: r.board_size,
     rated: r.rated == null ? null : !!r.rated,
     ratingsState: r.ratings_state as GameSummary["ratingsState"],
@@ -132,8 +138,8 @@ function toSummary(r: GameRow): GameSummary {
 }
 
 const SUMMARY_COLS = `id, bot_name, playtak_game_id, opponent, bot_color, result, outcome,
-  started_at, ended_at, move_count, board_size, server_host, rated, opponent_rating, bot_rating,
-  ratings_state`;
+  started_at, ended_at, move_count, undos_accepted, board_size, server_host, rated,
+  opponent_rating, bot_rating, ratings_state`;
 
 // Insert a finished game. Returns the new row id (or null if a legacy import hit its unique index).
 export function insertGame(rec: GameRecord, lines: string[]): number | null {
@@ -143,12 +149,12 @@ export function insertGame(rec: GameRecord, lines: string[]): number | null {
     .prepare(
       `INSERT OR IGNORE INTO games (
          bot_name, playtak_game_id, opponent, bot_color, result, outcome, started_at, ended_at,
-         move_count, board_size, server_host, server_port, rated, config_hash, config_json,
-         log_gz, log_bytes, created_at, legacy_id
+         move_count, undos_accepted, board_size, server_host, server_port, rated, config_hash,
+         config_json, log_gz, log_bytes, created_at, legacy_id
        ) VALUES (
          @bot_name, @playtak_game_id, @opponent, @bot_color, @result, @outcome, @started_at,
-         @ended_at, @move_count, @board_size, @server_host, @server_port, @rated, @config_hash,
-         @config_json, @log_gz, @log_bytes, @created_at, @legacy_id
+         @ended_at, @move_count, @undos_accepted, @board_size, @server_host, @server_port, @rated,
+         @config_hash, @config_json, @log_gz, @log_bytes, @created_at, @legacy_id
        )`
     )
     .run({
@@ -161,6 +167,7 @@ export function insertGame(rec: GameRecord, lines: string[]): number | null {
       started_at: rec.startedAt,
       ended_at: rec.endedAt,
       move_count: lines.filter((l) => l.startsWith("========== MOVE")).length,
+      undos_accepted: countUndosAccepted(lines),
       board_size: rec.boardSize,
       server_host: rec.serverHost,
       server_port: rec.serverPort,
