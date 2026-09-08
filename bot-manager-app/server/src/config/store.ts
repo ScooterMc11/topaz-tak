@@ -41,24 +41,29 @@ export async function loadConfig(): Promise<AppConfig> {
   } catch (e) {
     throw new Error(`config at ${CONFIG_PATH} is not valid JSON: ${(e as Error).message}`);
   }
-  // Schema migration. v3 -> v4 only ADDS the alwaysAllow tunable, so patch it in-place (default 50)
-  // and keep every calibrated value. Any other version gap (much older / future) falls back to a
-  // reseed rather than guessing. Local config only, so re-tuning is quick.
-  if (parsed.version === 3) {
+  // Schema migrations. Each step only ADDS a field, so patch it in-place and keep every calibrated
+  // value: v3 -> v4 adds the alwaysAllow tunable (default 50), v4 -> v5 the offerUndos switch
+  // (default on). A config two steps behind walks both. Any other version gap (much older /
+  // future) falls back to a reseed rather than guessing. Local config only, so re-tuning is quick.
+  if (parsed.version === 3 || parsed.version === 4) {
+    const from = parsed.version;
     for (const b of parsed.bots ?? []) {
-      if (b.tunables && b.tunables.alwaysAllow == null) b.tunables.alwaysAllow = 50;
+      if (from === 3 && b.tunables && b.tunables.alwaysAllow == null) b.tunables.alwaysAllow = 50;
+      if (b.offerUndos == null) b.offerUndos = true;
     }
     parsed.version = CONFIG_VERSION;
     const errors = validateConfig(parsed);
     if (errors.length) {
       throw new Error(
-        `config at ${CONFIG_PATH} failed validation after v3->v4 migration: ` +
+        `config at ${CONFIG_PATH} failed validation after v${from}->v${CONFIG_VERSION} migration: ` +
           errors.map((e) => `${e.path}: ${e.message}`).join("; ")
       );
     }
     await writeAtomic(parsed);
     cache = parsed;
-    console.log(`[bot-manager] migrated config v3 -> v${CONFIG_VERSION} (added alwaysAllow) at ${CONFIG_PATH}`);
+    console.log(
+      `[bot-manager] migrated config v${from} -> v${CONFIG_VERSION} at ${CONFIG_PATH}`
+    );
     return parsed;
   }
   if (parsed.version !== CONFIG_VERSION) {

@@ -41,9 +41,22 @@ export interface BotConfig {
   size: BotSize; // fixed
   level: BotLevel; // fixed (grouping + size link)
   enabled: boolean;
+  // Courtesy undo: offer to take back an opponent move that hung an instant road when they had a
+  // non-losing alternative. Deliberately NOT a tunable — it changes manners, not strength, so it
+  // stays out of the config hash and never splits a bot's ELO sample (see hash.ts).
+  offerUndos: boolean;
   tunables: BotTunables;
   advanced: BotAdvanced;
 }
+
+// How many courtesy undos a bot offers per game, by level: the weaker the bot, the more likely its
+// opponent is a beginner who'd rather take the move back. Passed to the engine as -UndoOffers;
+// `offerUndos: false` sends 0 instead, which turns the behaviour off outright.
+export const UNDO_OFFERS_BY_LEVEL: Record<BotLevel, number> = {
+  Novice: 3,
+  Intermediate: 2,
+  Advanced: 1,
+};
 
 export interface GlobalConfig {
   serverHost: string;
@@ -60,7 +73,7 @@ export interface AppConfig {
   bots: BotConfig[];
 }
 
-export const CONFIG_VERSION = 4;
+export const CONFIG_VERSION = 5;
 
 // --- Field ranges (min/max/step). Consumed by validation and served to the frontend. ---
 export interface NumRange {

@@ -4,8 +4,10 @@
 // Only the knobs that change play are included: the tunables (search mode/depth/nodes, drop rate,
 // bias, move pool, always-allow) and the advanced overrides (abort depth, time, hash, priority),
 // plus board size since a 5x5 and 6x6 bot with identical numbers are not the same player. Global
-// settings (server host, rated, stagger) and `enabled` are deliberately excluded — flipping Rated
-// or pointing at beta shouldn't wipe the sample.
+// settings (server host, rated, stagger), `enabled` and `offerUndos` are deliberately excluded —
+// flipping Rated, pointing at beta, or offering courtesy undos shouldn't wipe the sample. Note
+// that this works by construction: `configSnapshot` names the three fields it keeps, so a new
+// top-level field on BotConfig is out of the hash unless someone adds it here on purpose.
 import { createHash } from "node:crypto";
 import { BotConfig, BotTunables, BotAdvanced, BotSize } from "./schema.js";
 

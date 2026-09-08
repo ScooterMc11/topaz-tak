@@ -7,6 +7,14 @@ export type PriorityClass = "Idle" | "BelowNormal" | "Normal" | "AboveNormal" | 
 
 export type SearchMode = "depth" | "nodes";
 
+// Mirrors the server's UNDO_OFFERS_BY_LEVEL: how many courtesy undos a bot offers per game. Shown
+// in the "Offer undos" tooltip so the card says what the switch actually buys.
+export const UNDO_OFFERS_BY_LEVEL: Record<BotLevel, number> = {
+  Novice: 3,
+  Intermediate: 2,
+  Advanced: 1,
+};
+
 export interface BotTunables {
   searchMode: SearchMode;
   depth: number;
@@ -31,6 +39,9 @@ export interface BotConfig {
   size: BotSize;
   level: BotLevel;
   enabled: boolean;
+  // Courtesy undo: offer to take back an opponent move that hung an instant road. Not a tunable —
+  // it's excluded from the config hash, so toggling it never splits a bot's ELO sample.
+  offerUndos: boolean;
   tunables: BotTunables;
   advanced: BotAdvanced;
 }

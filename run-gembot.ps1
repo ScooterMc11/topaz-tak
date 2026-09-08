@@ -50,6 +50,12 @@ param(
   # never overrides a solved/decisive position or plays a losing move. Large default = disabled, so
   # standalone / ladder launches are unaffected unless set. The bot-manager passes the real value.
   [int]$AlwaysAllow = 1000000,
+  # Courtesy undo: how many times per game the bot may offer to take back an opponent move that hung
+  # an instant road while a non-losing alternative was available. It requests the undo, says so in
+  # chat, and plays the winning move if the opponent says "gg" or goes quiet for a minute (the wait
+  # is capped by its own clock, so it can never flag over this). 0 = off, the default, so standalone
+  # / ladder launches are unaffected. The bot-manager passes the per-level cap.
+  [int]$UndoOffers = 0,
   # Legacy softmax knob (superseded by EvalGap; kept for experiments). Higher => weaker.
   [int]$Temperature = 0,
   [int]$MovePool = 8,        # MultiPV pool the gap/temperature selection samples within (max 16)
@@ -81,6 +87,7 @@ $env:PLAYTAK_EVAL_GAP_MAX = "$EvalGapMax"
 # Invariant format so the decimal separator is always '.' (Rust f64 parse), regardless of locale.
 $env:PLAYTAK_BIAS_SLOPE = $BiasSlope.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $env:PLAYTAK_ALWAYS_ALLOW = "$AlwaysAllow"
+$env:PLAYTAK_UNDO_OFFERS = "$UndoOffers"
 $env:PLAYTAK_MOVE_POOL = "$MovePool"
 $env:PLAYTAK_HASH_MB = "$HashMb"
 $env:PLAYTAK_OPENING = "1"        # Double Black Stack
@@ -94,8 +101,8 @@ $bin = Join-Path $PSScriptRoot "target\release\topaz.exe"
 if (-not (Test-Path $bin)) { Write-Error "topaz.exe not found at $bin - build it first (cargo build --release)"; exit 1 }
 
 $searchDesc = if ($Depth -gt 0) { "depth $Depth (fixed)" } else { "nodes $Nodes" }
-Write-Host ("Launching {0}: size {1}, {2}, abort {3}, gap {4}, dyn-gap {5}/{6}/{7}, slope {8}, always-allow {9}, temp {10}, pool {11}, time {12}s, hash {13}MB, prio {14}, {15}:{16}, rated={17}" -f `
-    $User, $Size, $searchDesc, $AbortDepth, $EvalGap, $EvalGapMin, $EvalGapStd, $EvalGapMax, $BiasSlope, $AlwaysAllow, $Temperature, $MovePool, $Time, $HashMb, $Priority, $ServerHost, $Port, $Rated.IsPresent)
+Write-Host ("Launching {0}: size {1}, {2}, abort {3}, gap {4}, dyn-gap {5}/{6}/{7}, slope {8}, always-allow {9}, temp {10}, pool {11}, time {12}s, hash {13}MB, prio {14}, {15}:{16}, rated={17}, undo-offers {18}" -f `
+    $User, $Size, $searchDesc, $AbortDepth, $EvalGap, $EvalGapMin, $EvalGapStd, $EvalGapMax, $BiasSlope, $AlwaysAllow, $Temperature, $MovePool, $Time, $HashMb, $Priority, $ServerHost, $Port, $Rated.IsPresent, $UndoOffers)
 while ($true) {
   # Start in the SAME console (-NoNewWindow) so output stays visible and the child inherits the
   # PLAYTAK_* env vars set above; -PassThru lets us drop its priority before it starts searching.
