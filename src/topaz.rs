@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use telnet::Event;
 use topaz_tak::board::{Board5, Board6};
-use topaz_tak::eval::{Evaluator, Weights6, NNUE4, NNUE5, NNUE6};
+use topaz_tak::eval::{Evaluator, Weights6, LOSS_FOUND, NNUE4, NNUE5, NNUE6};
 use topaz_tak::proof::TinueSearch;
 use topaz_tak::search::{search, SearchInfo};
 use topaz_tak::transposition_table::HashTable;
@@ -1989,6 +1989,50 @@ fn send_playtak_move(
     moves.push(playtak_m);
 }
 
+/// Node cap for the "were they already lost?" probe. Measured on playtak game #871090: 2ms when
+/// the forced loss is there to be found, ~60ms when it isn't. It replaces the full-strength search
+/// this path would otherwise have run, so the offer costs the clock less than a normal move.
+const UNDO_PROBE_NODES: u64 = 20_000;
+
+/// Was the opponent already lost before they moved?
+///
+/// `board` is the position AFTER their move; `last` steps back to the one they moved from. A
+/// bounded search there, from THEIR side, answers the only question that matters: did they have
+/// anything better? Mate scores in this engine are exact rather than heuristic, so a `LOSS_FOUND`
+/// verdict is a proof that every reply loses — the game was already decided when they sat down to
+/// move, and taking it back would only replay a lost position.
+///
+/// This is the case a "did they dodge the immediate road?" test cannot see. In playtak game
+/// #871090 White was in a proven loss by move 41, so `e2<` was not the mistake that cost the game
+/// and the undo offered for it was wrong.
+///
+/// Deliberately fail-open: a position the search can't resolve inside the cap is not a simple
+/// forced loss, which is exactly the case where the opponent did have real choices. The board is
+/// left exactly as it was found.
+fn opponent_was_already_lost<E: Evaluator>(
+    board: &mut E::Game,
+    last: RevGameMove,
+    eval: &mut E,
+    table: &HashTable,
+) -> bool {
+    board.reverse_move(last);
+    let mut info = SearchInfo::new(MAX_PROBE_DEPTH, table)
+        .time_bank(TimeBank::flat(3_000))
+        // Honor the node cap from the very first iteration; the engine default (6) would impose a
+        // floor well above it and make the probe far more expensive than intended.
+        .abort_depth(1)
+        .quiet(true)
+        .set_max_nodes(UNDO_PROBE_NODES, UNDO_PROBE_NODES);
+    let score = topaz_tak::search::search(board, eval, &mut info)
+        .map(|r| r.score())
+        .unwrap_or(0);
+    board.do_move(last.game_move);
+    score <= LOSS_FOUND
+}
+
+/// Iterative-deepening ceiling for the probe. The node cap binds long before this.
+const MAX_PROBE_DEPTH: usize = 16;
+
 /// Did the opponent have a way out, or was the loss forced?
 ///
 /// `board` is the position AFTER their move (the bot to play) and `last` the reverse handle for
@@ -2101,7 +2145,11 @@ fn play_game_playtak<E: Evaluator + Default + Send>(
                     let mut storage = Vec::new();
                     if let Some(win) = board.can_make_road(&mut storage, None) {
                         let last = rev_cache[rev_cache.len() - 1];
-                        if opponent_had_an_out(&mut board, last) {
+                        // Cheap test first: did they have a move that dodges the road at all? Only
+                        // then pay for the search that asks whether dodging would have helped.
+                        if opponent_had_an_out(&mut board, last)
+                            && !opponent_was_already_lost::<E>(&mut board, last, &mut eval, &table)
+                        {
                             let win_ptn = win.to_ptn::<E::Game>();
                             let stm = if board.side_to_move() == Color::White { "White" } else { "Black" };
                             // Same MOVE banner the search path prints: it keeps the log readable and
@@ -2679,7 +2727,7 @@ fn playtak_loop(
 #[cfg(test)]
 mod courtesy_undo_tests {
     use super::*;
-    use topaz_tak::board::Board6;
+    use topaz_tak::board::{Board5, Board6};
 
     /// Play one PTN move and hand back the reverse handle, the way the Position handler does.
     fn play(board: &mut Board6, ptn: &str) -> RevGameMove {
@@ -2765,6 +2813,71 @@ mod courtesy_undo_tests {
         assert!(undo_wait(Some(600_000), offers_for_game(-1)).is_some());
     }
 
+    /// Playtak game #871090, AdvancedBot5 (black) vs Klimace. Plies exactly as the engine saw them,
+    /// including the take-back of White's `P E3` at move 30 — the telnet loop pops an accepted undo
+    /// from its move list, so the rolled-back move is absent here too.
+    const G871090: &str = "P A5,P A3,P C3,P D2,P D3,P B3 C,P C2,M B3 C3 1,P C4,P B4,P B3 C,P D4,P C5,P B5,P D5,P B2,P E5,P E4,M B3 B4 1,M A5 A3 1 1,P A5,M B5 C5 1,P B5,M C3 C4 2,P B3,P C3,M C2 B2 1,P B1 W,P A2,P A1,P C2,M B1 B2 1,M A2 A3 1,M A4 A3 1,M B3 A3 1,P B3,P A4,M B3 A3 1,M A4 A3 1,P D1,M B5 C5 1,M E4 E5 1,M C5 E5 1 2,P E4 W,M D5 D3 1 1,M E4 E5 1,M D3 D1 1 1,P B3 W,M A3 A1 2 2,M B2 A2 3,P D3,M A2 D2 1 1 2,M A3 A2 2,M D2 A2 1 1 1,M C2 E2 1 2,M A2 D2 1 1 2,P A2,M E5 A5 1 1 1 2,M D5 C5 1,P D5,M D3 C3 1,P B1,P A4,M D5 C5 1,P D5 W,M D2 D1 3,M D5 C5 1,M B1 A1 1,M A2 A1 1,P A2,M A1 A2 2,M A5 A2 1 1 1,M C5 A5 2 2,M A2 A1 2,M A3 A2 1,P E3,P C5,M A1 A4 1 1 3,M C3 C2 2,M A2 C2 1 2,M E2 D2 2,M C2 E2 1 3";
+
+    /// Replay the first `n` plies of that game the way the Position handler does, including the
+    /// Double Black Stack reconstruction of White's opening.
+    fn replay_871090(n: usize) -> (Board5, RevGameMove) {
+        let mut board = Board5::start_position().with_komi(0);
+        let mut last = None;
+        for m in G871090.split(',').take(n) {
+            let mut mv = GameMove::try_from_playtak(m, &board).expect("bad playtak move");
+            if board.move_num() == 1
+                && board.side_to_move() == Color::White
+                && mv.is_place_move()
+                && !mv.is_stack_move()
+            {
+                let sq = mv.to_ptn::<Board5>();
+                mv = GameMove::try_from_ptn_m(&format!("2{}", sq), 5, Color::White).unwrap();
+            }
+            last = Some(board.do_move(mv));
+        }
+        (board, last.expect("no plies replayed"))
+    }
+
+    fn probe(board: &mut Board5, last: RevGameMove) -> bool {
+        let table = HashTable::new(16 << 20);
+        let mut eval = NNUE5::default();
+        opponent_was_already_lost::<NNUE5>(board, last, &mut eval, &table)
+    }
+
+    /// The bug: White's 41st move (`e2<`) drew a courtesy undo, but White was already in a proven
+    /// loss — no move would have saved the game, so there was no careless mistake to take back.
+    #[test]
+    fn already_lost_is_not_a_blunder() {
+        let (mut after, last) = replay_871090(81);
+        // The trigger fired legitimately: the bot really does have an instant road here.
+        assert_eq!(
+            after.can_make_road(&mut Vec::new(), None).map(|m| m.to_ptn::<Board5>()),
+            Some("4c2>13".to_string())
+        );
+        // And the shallow test alone would offer, because White had moves dodging that road...
+        assert!(opponent_had_an_out(&mut after, last));
+        // ...but the position was decided before White touched it.
+        assert!(probe(&mut after, last), "White was in a proven loss and should get no offer");
+    }
+
+    /// The same game ten plies earlier: an ordinary position, nothing forced either way. A real
+    /// blunder here must still earn its offer.
+    #[test]
+    fn an_open_position_is_not_called_lost() {
+        let (mut board, last) = replay_871090(71);
+        assert!(!probe(&mut board, last));
+    }
+
+    /// The probe must leave the board exactly as it found it — the caller goes on to use it.
+    #[test]
+    fn probe_restores_the_board() {
+        let (mut board, last) = replay_871090(81);
+        let before = board.clone();
+        probe(&mut board, last);
+        assert_eq!(board, before);
+        assert_eq!(board.zobrist(), before.zobrist());
+    }
+
     /// Every chat line must survive the server's ISO-8859-1 decode and its 256-character cap.
     #[test]
     fn offer_messages_are_wire_safe() {
@@ -2775,4 +2888,5 @@ mod courtesy_undo_tests {
         }
     }
 }
+
 
