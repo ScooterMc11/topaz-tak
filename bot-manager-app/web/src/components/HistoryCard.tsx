@@ -115,6 +115,7 @@ export default function HistoryCard({ onOpenGame }: HistoryCardProps) {
               </Box>
               <Typography variant="caption" color="text.secondary">
                 {fmtDateTime(g.startedAt)} · {fmtDuration(g.startedAt, g.endedAt)} · {g.moveCount} moves
+                {g.undosAccepted > 0 ? ` · ${g.undosAccepted} undo${g.undosAccepted === 1 ? "" : "s"}` : ""}
               </Typography>
             </ListItemButton>
           ))}
@@ -133,6 +134,9 @@ export default function HistoryCard({ onOpenGame }: HistoryCardProps) {
               <TableCell>Date</TableCell>
               <TableCell align="right">Duration</TableCell>
               <TableCell align="right">Moves</TableCell>
+              <Tooltip title="Courtesy undos this opponent accepted — moves the bot offered to take back after they hung a road">
+                <TableCell align="right">Undos</TableCell>
+              </Tooltip>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -164,6 +168,12 @@ export default function HistoryCard({ onOpenGame }: HistoryCardProps) {
                 <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtDateTime(g.startedAt)}</TableCell>
                 <TableCell align="right" sx={{ whiteSpace: "nowrap" }}>{fmtDuration(g.startedAt, g.endedAt)}</TableCell>
                 <TableCell align="right">{g.moveCount}</TableCell>
+                <TableCell
+                  align="right"
+                  sx={{ color: g.undosAccepted > 0 ? "text.primary" : "text.disabled" }}
+                >
+                  {g.undosAccepted > 0 ? g.undosAccepted : "—"}
+                </TableCell>
               </TableRow>
             ))}
           </TableBody>
