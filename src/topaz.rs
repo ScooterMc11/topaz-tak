@@ -257,8 +257,9 @@ pub fn main() {
             opts.optopt(
                 "",
                 "alts-min-decided",
-                "Gate --alts to plies played from a position at least this decided, measured on \
-                 the leader's win probability going in (0.5 even, 1 a proven win, either player)",
+                "Gate --alts to plies with a position at least this decided on either side of \
+                 them, measured on the leader's win probability (0.5 even, 1 a proven win, either \
+                 player, before the ply or after it)",
                 "P",
             );
             opts.optopt(

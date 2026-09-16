@@ -176,7 +176,9 @@
 //! and `--alts-max-loss` name the plies worth spending it on. Both are the *caller's* thresholds
 //! handed to the engine — nothing here decides which plies matter, it only avoids searching the ones
 //! the caller has already said it will ignore. Note that the first is read off the **leader's** win
-//! probability rather than the mover's, so it admits both players' moves out of a settled position.
+//! probability rather than the mover's, so it admits both players' moves out of a settled position,
+//! and off **either side of the ply**, so it also admits the move that settled the game as it was
+//! played.
 
 use crate::board::{Board4, Board5, Board6, Piece, TakBoard};
 use crate::eval::{Evaluator, LOSE_SCORE, NNUE4, NNUE5, NNUE6, WIN_SCORE};
@@ -328,14 +330,19 @@ pub struct AnalyzeGameConfig {
     /// How many root moves to enumerate alongside a ply (see `Alternatives`). 0 turns the whole
     /// thing off, which is the default; the search caps it at `MAX_MULTI_PV`.
     pub alts: usize,
-    /// Only plies played from a position at least this **decided** get an alternatives list, where
-    /// decidedness is the *leader's* win probability going in — `max(p, 1 - p)`, so 0.5 is dead
-    /// even and 1 is a proven win, whichever player holds it.
+    /// Only plies with a position at least this **decided** on one side of them get an
+    /// alternatives list, where decidedness is the *leader's* win probability — `max(p, 1 - p)`, so
+    /// 0.5 is dead even and 1 is a proven win, whichever player holds it.
     ///
-    /// Two-sided on purpose: "this game is settled" is a fact about the position, not about who is
-    /// to move in it, and a caller weighing how hard a move was to find wants it for the player
-    /// being ground down as much as for the one doing the grinding. The caller's threshold, not the
-    /// engine's — see the module docs.
+    /// Two-sided in both senses. **Whose** probability: "this game is settled" is a fact about the
+    /// position, not about who is to move in it, and a caller weighing how hard a move was to find
+    /// wants it for the player being ground down as much as for the one doing the grinding.
+    /// **Which position**: the ply going in *and* the ply coming out, taken at whichever of the two
+    /// reads more decided. A caller can hold the two players to opposite sides of the ply — the one
+    /// behind to the position their move left, the one ahead to the position they moved from — and
+    /// this way the list is there for either reading, rather than the engine deciding on its own
+    /// which of them the caller meant. The caller's threshold, not the engine's — see the module
+    /// docs.
     pub alts_min_decided: f64,
     /// ...and only those that gave up at most this many **win percentage points**, on the same
     /// normalised footing the caller grades on (`loss_cp` against `cp_before`). A ply the loss
@@ -1735,11 +1742,18 @@ where
         // this gate used to do wrong — and a ply whose loss read as thousands of cp was skipped
         // here for being far past the caller's threshold when it had barely given anything up.
         let loss_pct = grade.loss_win_pct().unwrap_or(f64::INFINITY);
-        // How settled the game was, from the leader's side whichever that is (see
-        // `alts_min_decided`). The mover's own probability is the wrong reading here: a position
-        // one player has locked up is equally locked up for the other, and the moves worth
-        // enumerating alternatives for come from both of them.
-        let decided = win_prob_before.max(1.0 - win_prob_before);
+        // How settled the game was, from the leader's side whichever that is, and on whichever
+        // side of the ply reads more decided (see `alts_min_decided`). The mover's own probability
+        // is the wrong reading here: a position one player has locked up is equally locked up for
+        // the other, and the moves worth enumerating alternatives for come from both of them.
+        //
+        // Both sides of the ply, because a caller may gate a move on the position it *reached* —
+        // and a ply that crossed the line while being played is exactly the one whose alternatives
+        // it then has nothing to appeal on. `win_prob_white` is the same reading through the bar;
+        // decidedness is symmetric, so the frame it is quoted in does not matter.
+        let decided = win_prob_before
+            .max(1.0 - win_prob_before)
+            .max(win_prob_white.max(1.0 - win_prob_white));
         let alts = if cfg.alts > 0
             && decided >= cfg.alts_min_decided
             && loss_pct <= cfg.alts_max_loss_pct
