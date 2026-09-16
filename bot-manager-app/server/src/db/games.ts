@@ -237,13 +237,24 @@ export interface EloStats {
   configHash: string;
   won: number[]; // opponent ELOs of games this config won, ascending
   lost: number[]; // ...and lost
-  matchedGames: number; // games on this config (any outcome, rated or not)
+  matchedGames: number; // games on this config that count (any outcome, rated or not)
   totalGames: number; // games for this bot across every config
-  pendingRatings: number; // matched games still waiting on an ELO lookup
+  pendingRatings: number; // counted games still waiting on an ELO lookup
+  walkovers: number; // games on this config dropped by NOT_A_WALKOVER
 }
 
+// PlayTak reports a game decided by resignation, timeout or a disconnect as a plain '1-0'/'0-1';
+// games actually played out end in a road ('R-0'/'0-R') or flat ('F-0'/'0-F') token instead. When
+// one of those default endings arrives before the bot has taken board_size moves, nobody really
+// played the game — the opponent sat down, made a move or two, and left — so it says nothing about
+// the bot's strength and the ELO plots leave it out. `move_count` is the bot's own turns (one per
+// "========== MOVE" marker in the log), i.e. moves rather than plies, which is the unit the board
+// size is compared against. A row with no recorded board size can't be judged, so it's kept.
+const NOT_A_WALKOVER = `(board_size IS NULL OR result NOT IN ('1-0', '0-1') OR move_count >= board_size)`;
+
 // Opponent ELOs split by outcome, restricted to games played on `configHash`. Draws are excluded
-// (the box plots are specifically won-against vs lost-against), as are games with no known rating.
+// (the box plots are specifically won-against vs lost-against), as are games with no known rating
+// and the walkovers described above.
 export function eloStats(botName: string, hash: string): EloStats {
   const db = getDb();
   const pick = (outcome: "win" | "loss") =>
@@ -252,6 +263,7 @@ export function eloStats(botName: string, hash: string): EloStats {
         .prepare(
           `SELECT opponent_rating AS r FROM games
             WHERE bot_name = ? AND config_hash = ? AND outcome = ? AND opponent_rating IS NOT NULL
+              AND ${NOT_A_WALKOVER}
             ORDER BY opponent_rating`
         )
         .all(botName, hash, outcome) as { r: number }[]
@@ -265,14 +277,22 @@ export function eloStats(botName: string, hash: string): EloStats {
     won: pick("win"),
     lost: pick("loss"),
     matchedGames: count(
-      `SELECT COUNT(*) AS n FROM games WHERE bot_name = ? AND config_hash = ?`,
+      `SELECT COUNT(*) AS n FROM games
+        WHERE bot_name = ? AND config_hash = ? AND ${NOT_A_WALKOVER}`,
       botName,
       hash
     ),
     totalGames: count(`SELECT COUNT(*) AS n FROM games WHERE bot_name = ?`, botName),
     pendingRatings: count(
       `SELECT COUNT(*) AS n FROM games
-        WHERE bot_name = ? AND config_hash = ? AND ratings_state = 'pending'`,
+        WHERE bot_name = ? AND config_hash = ? AND ratings_state = 'pending'
+          AND ${NOT_A_WALKOVER}`,
+      botName,
+      hash
+    ),
+    walkovers: count(
+      `SELECT COUNT(*) AS n FROM games
+        WHERE bot_name = ? AND config_hash = ? AND NOT ${NOT_A_WALKOVER}`,
       botName,
       hash
     ),

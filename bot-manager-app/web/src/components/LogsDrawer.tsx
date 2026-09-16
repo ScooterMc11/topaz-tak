@@ -242,6 +242,8 @@ export default function LogsDrawer({ target, onClose, configVersion = 0 }: LogsD
                 lost={elo.lost}
                 matchedGames={elo.matchedGames}
                 pendingRatings={elo.pendingRatings}
+                walkovers={elo.walkovers}
+                boardSize={elo.config.size}
               />
             )}
           </Box>

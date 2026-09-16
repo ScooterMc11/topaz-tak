@@ -163,7 +163,8 @@ export interface GameDetail extends GameSummary {
 }
 
 // Opponent-ELO distributions for a bot's *current* configuration. `won`/`lost` are ascending
-// opponent ratings; a config that's never been played returns both empty.
+// opponent ratings; a config that's never been played returns both empty. Walkovers — a default
+// ending before the bot took `config.size` moves — are counted separately and left out of the rest.
 export interface EloStats {
   name: string;
   config: ConfigSnapshot;
@@ -173,6 +174,7 @@ export interface EloStats {
   matchedGames: number;
   totalGames: number;
   pendingRatings: number;
+  walkovers: number;
 }
 
 export const LEVEL_ORDER: BotLevel[] = ["Advanced", "Intermediate", "Novice"];
