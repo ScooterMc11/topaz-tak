@@ -1,6 +1,8 @@
 // Two horizontal box plots on a shared ELO axis: the opponent ratings this bot has WON against,
 // and the ones it has LOST against. Both come from games matching the bot's *current* configuration,
-// so changing a tunable starts the sample over.
+// so changing a tunable starts the sample over. Walkovers (an opponent who joined and left, leaving
+// a default result inside the first `boardSize` moves) are filtered out server-side and reported
+// here as a count, so a bot's plots can't be moved by games nobody played.
 //
 // Drawn with positioned divs rather than SVG so it scales to any container width without stretching
 // stroke widths — a box plot is only rects and lines, and percentage offsets do that natively.
@@ -187,6 +189,25 @@ interface EloBoxPlotsProps {
   lost: number[];
   matchedGames: number;
   pendingRatings: number;
+  walkovers: number;
+  boardSize: number;
+}
+
+// The caption under an empty pair of plots: why there's nothing to draw yet.
+function emptyMessage(
+  matchedGames: number,
+  pendingRatings: number,
+  walkovers: number,
+  boardSize: number
+): string {
+  if (matchedGames === 0 && walkovers === 0)
+    return "No games on this configuration yet — the opponent-ELO plots start over whenever you change a bot's settings.";
+  if (matchedGames === 0)
+    return `Nothing to plot on this configuration yet — its only game${walkovers > 1 ? "s were walkovers" : " was a walkover"}, decided by default inside ${boardSize} moves.`;
+  const games = `${matchedGames} game${matchedGames > 1 ? "s" : ""} on this configuration`;
+  return pendingRatings > 0
+    ? `${games}; still looking up opponent ratings.`
+    : `${games}, none with a rated opponent.`;
 }
 
 export default function EloBoxPlots({
@@ -194,6 +215,8 @@ export default function EloBoxPlots({
   lost,
   matchedGames,
   pendingRatings,
+  walkovers,
+  boardSize,
 }: EloBoxPlotsProps) {
   const theme = useTheme();
   const wonStats = boxStats(won);
@@ -207,14 +230,16 @@ export default function EloBoxPlots({
   const domain: [number, number] = [Math.floor(rawLo - pad), Math.ceil(rawHi + pad)];
   const mid = Math.round((domain[0] + domain[1]) / 2);
 
+  // Only worth spelling out beside a drawn plot; the empty-state caption says it in prose instead.
+  const walkoverNote =
+    walkovers > 0
+      ? `${walkovers} walkover${walkovers > 1 ? "s" : ""} excluded — decided by default inside ${boardSize} moves.`
+      : null;
+
   if (all.length === 0) {
     return (
       <Typography variant="caption" color="text.secondary">
-        {matchedGames === 0
-          ? "No games on this configuration yet — the opponent-ELO plots start over whenever you change a bot's settings."
-          : pendingRatings > 0
-            ? `${matchedGames} game${matchedGames > 1 ? "s" : ""} on this configuration; still looking up opponent ratings.`
-            : `${matchedGames} game${matchedGames > 1 ? "s" : ""} on this configuration, none with a rated opponent.`}
+        {emptyMessage(matchedGames, pendingRatings, walkovers, boardSize)}
       </Typography>
     );
   }
@@ -246,6 +271,15 @@ export default function EloBoxPlots({
       {pendingRatings > 0 && (
         <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>
           {pendingRatings} game{pendingRatings > 1 ? "s" : ""} still awaiting an opponent rating.
+        </Typography>
+      )}
+      {walkoverNote && (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ fontSize: 10, display: "block" }}
+        >
+          {walkoverNote}
         </Typography>
       )}
     </Box>
