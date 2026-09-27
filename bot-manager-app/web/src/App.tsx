@@ -18,7 +18,7 @@ import StopIcon from "@mui/icons-material/Stop";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
-import { api } from "./api";
+import { api, getPlaytakRating } from "./api";
 import type {
   AppConfig,
   BotAdvanced,
@@ -57,6 +57,46 @@ function useBackendHealth(intervalMs = 3000): HealthState {
     };
   }, [intervalMs]);
   return state;
+}
+
+// PlayTak stores 0 for "no rating yet"; anything under this is treated as absent (as in db/ratings.ts).
+const MIN_REAL_RATING = 100;
+const RATINGS_REFRESH_MS = 60_000;
+
+// Each bot's current PlayTak rating, keyed by bot name, polled from the saved server's API. A bot
+// whose lookup fails keeps its last known value; one with no rating yet is left out.
+function useBotRatings(serverHost: string | undefined, names: string[]): Record<string, number> {
+  const [ratings, setRatings] = useState<Record<string, number>>({});
+  const key = names.join(",");
+  useEffect(() => {
+    if (!serverHost) return;
+    let cancelled = false;
+    setRatings({});
+    async function load() {
+      const results = await Promise.all(
+        names.map((n) => getPlaytakRating(serverHost!, n)?.catch(() => null) ?? null)
+      );
+      if (cancelled) return;
+      setRatings((prev) => {
+        const next = { ...prev };
+        results.forEach((r, i) => {
+          if (r && typeof r.rating === "number") {
+            if (r.rating >= MIN_REAL_RATING) next[names[i]] = Math.round(r.rating);
+            else delete next[names[i]];
+          }
+        });
+        return next;
+      });
+    }
+    load();
+    const id = setInterval(load, RATINGS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverHost, key]);
+  return ratings;
 }
 
 const GAME_TIMES_KEY = "botManager.gameStartTimes";
@@ -155,6 +195,12 @@ export default function App() {
   const dirty = useMemo(
     () => !!draft && !!baseline && JSON.stringify(draft) !== JSON.stringify(baseline),
     [draft, baseline]
+  );
+
+  // Ratings follow the SAVED server, since that's where the bots are actually playing.
+  const ratings = useBotRatings(
+    baseline?.global.serverHost,
+    useMemo(() => baseline?.bots.map((b) => b.name) ?? [], [baseline])
   );
 
   // Rough RAM budget: sum the hash tables of enabled bots (the one config knob that reserves memory).
@@ -431,6 +477,7 @@ export default function App() {
                         bot={bot}
                         schema={schema}
                         status={statuses[bot.name]}
+                        rating={ratings[bot.name]}
                         gameStartedAt={
                           statuses[bot.name]?.inGame && statuses[bot.name]?.gameId
                             ? gameStartTimes[`${bot.name}:${statuses[bot.name]!.gameId}`]

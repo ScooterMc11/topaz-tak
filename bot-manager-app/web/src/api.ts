@@ -34,6 +34,28 @@ async function sendJson<T>(method: string, url: string, body: unknown): Promise<
   return res.json() as Promise<T>;
 }
 
+// PlayTak deployment -> the Vite proxy prefix for its public HTTP API (see vite.config.ts). Mirrors
+// API_BY_HOST in the server's db/ratings.ts.
+const PLAYTAK_API_BY_HOST: Record<string, string> = {
+  "playtak.com": "/playtak-api/live",
+  "www.playtak.com": "/playtak-api/live",
+  "beta.playtak.com": "/playtak-api/beta",
+  localhost: "/playtak-api/local",
+  "127.0.0.1": "/playtak-api/local",
+};
+
+export interface PlaytakRating {
+  name: string;
+  rating: number;
+  ratedgames: number;
+}
+
+// A player's rating right now, straight from PlayTak. null for a deployment with no known API.
+export function getPlaytakRating(serverHost: string, name: string): Promise<PlaytakRating> | null {
+  const base = PLAYTAK_API_BY_HOST[serverHost.toLowerCase()];
+  return base ? getJson<PlaytakRating>(`${base}/v1/ratings/${encodeURIComponent(name)}`) : null;
+}
+
 export const api = {
   health: () => getJson<{ ok: boolean }>("/api/health"),
   getConfig: () => getJson<AppConfig>("/api/config"),

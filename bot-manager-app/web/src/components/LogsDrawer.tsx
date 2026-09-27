@@ -5,7 +5,8 @@
 // The header carries two box plots of the opponent ELOs this bot has won and lost against, matched
 // to its CURRENT configuration (see the /elo-stats route).
 // On phones there isn't room for list + log side by side, so the list fills the panel and tapping a
-// game opens its log in a full-screen dialog instead.
+// game opens its log in a full-screen dialog instead.  Closing a game the History card opened
+// directly closes the whole drawer too.
 import { useEffect, useRef, useState } from "react";
 import Drawer from "@mui/material/Drawer";
 import Dialog from "@mui/material/Dialog";
@@ -140,6 +141,13 @@ export default function LogsDrawer({ target, onClose, configVersion = 0 }: LogsD
       cancelled = true;
     };
   }, [botName, selectedId]);
+
+  // Phones: closing a game that was opened straight from the main page's History card goes all the
+  // way back there, instead of leaving the user on this bot's game list to close separately.
+  function closeGame() {
+    if (target?.gameId && selectedId === target.gameId) onClose();
+    else setSelectedId(null);
+  }
 
   const gameList =
     games === null ? (
@@ -290,7 +298,7 @@ export default function LogsDrawer({ target, onClose, configVersion = 0 }: LogsD
       <Dialog
         fullScreen
         open={stacked && !!botName && tab === "history" && !!selectedId}
-        onClose={() => setSelectedId(null)}
+        onClose={closeGame}
       >
         <Box sx={{ display: "flex", flexDirection: "column", height: "100dvh", minHeight: 0 }}>
           <Box
@@ -308,7 +316,7 @@ export default function LogsDrawer({ target, onClose, configVersion = 0 }: LogsD
             <Typography variant="subtitle2" noWrap>
               {botName} · vs {game?.opponent ?? "…"}
             </Typography>
-            <IconButton size="small" onClick={() => setSelectedId(null)}>
+            <IconButton size="small" onClick={closeGame}>
               <CloseIcon fontSize="small" />
             </IconButton>
           </Box>
