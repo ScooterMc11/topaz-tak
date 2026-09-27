@@ -41,6 +41,7 @@ interface BotCardProps {
   bot: BotConfig;
   schema: ConfigSchema;
   status?: BotStatus;
+  rating?: number; // current PlayTak rating; undefined while unknown or unrated
   gameStartedAt?: number; // client-observed start time of the current game (for the duration chip)
   dirty: boolean;
   onTunables: (patch: Partial<BotTunables>) => void;
@@ -97,6 +98,7 @@ export default function BotCard({
   bot,
   schema,
   status,
+  rating,
   gameStartedAt,
   dirty,
   onTunables,
@@ -173,7 +175,18 @@ export default function BotCard({
             </IconButton>
           </Tooltip>
         }
-        title={bot.name}
+        title={
+          <>
+            {bot.name}
+            {rating != null && (
+              <Tooltip title="Current PlayTak rating">
+                <Box component="span" sx={{ ml: 1, color: "text.secondary", fontSize: "0.875em" }}>
+                  ({rating})
+                </Box>
+              </Tooltip>
+            )}
+          </>
+        }
         titleTypographyProps={{ variant: "subtitle1" }}
         subheader={
           <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, minWidth: 0 }}>

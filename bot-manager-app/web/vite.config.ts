@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Dev server on 5173. All /api calls are proxied to the backend so the browser sees a single origin
@@ -10,6 +10,22 @@ import react from "@vitejs/plugin-react";
 // There is NO auth on this panel, so only broaden this on networks you trust (home Wi-Fi / Tailscale),
 // and open the Windows Firewall for TCP 5173 on the Private profile. Set to "127.0.0.1" to lock it
 // back down to this machine only.
+//
+// /playtak-api/<deployment> reaches PlayTak's public HTTP API for the bot cards' current ratings.
+// That API refuses cross-origin browser requests, so it has to come through here like /api does.
+function playtakApi(deployment: string, target: string): Record<string, ProxyOptions> {
+  const prefix = `/playtak-api/${deployment}`;
+  return {
+    [prefix]: {
+      target,
+      changeOrigin: true,
+      rewrite: (path) => path.slice(prefix.length),
+      // The API's CORS check rejects any request that names an origin other than playtak.com.
+      configure: (proxy) => proxy.on("proxyReq", (req) => req.removeHeader("origin")),
+    },
+  };
+}
+
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -20,6 +36,9 @@ export default defineConfig({
         target: "http://127.0.0.1:4317",
         changeOrigin: true,
       },
+      ...playtakApi("live", "https://api.playtak.com"),
+      ...playtakApi("beta", "https://api.beta.playtak.com"),
+      ...playtakApi("local", "http://localhost:3004"),
     },
   },
 });
