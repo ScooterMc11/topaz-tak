@@ -13,6 +13,8 @@ pub mod balance5;
 #[cfg(feature = "evaluation")]
 pub mod analyze_game;
 #[cfg(feature = "evaluation")]
+pub mod analyze_tei;
+#[cfg(feature = "evaluation")]
 pub mod balanced_lines;
 pub mod board;
 #[cfg(feature = "evaluation")]
@@ -48,6 +50,9 @@ pub struct GameInitializer {
     pub hash_size: usize,
     pub max_depth: usize,
     pub komi: u8,
+    /// The opening, when a GUI said which (`setoption DoubleBlackStack`). `None` keeps the old rule
+    /// that ties it to komi — see `TakBoard::double_black_stack`.
+    pub double_black_stack: Option<bool>,
     pub add_noise: bool,
     pub num_threads: usize,
     pub max_nodes: i64,
@@ -90,6 +95,7 @@ impl GameInitializer {
             hash_size,
             max_depth,
             komi,
+            double_black_stack: None,
             add_noise,
             max_nodes: -1,
             num_threads: 1,
@@ -106,13 +112,18 @@ impl GameInitializer {
         }
     }
     pub fn get_board<E: eval::Evaluator + Default>(&self) -> (E::Game, E) {
-        (E::Game::start_position().with_komi(self.komi), E::default())
+        (self.with_opening(E::Game::start_position()), E::default())
     }
     pub fn get_board_tps<E: eval::Evaluator + Default>(&self, tps: &str) -> (E::Game, E) {
-        (
-            E::Game::try_from_tps(tps).unwrap().with_komi(self.komi),
-            E::default(),
-        )
+        (self.with_opening(E::Game::try_from_tps(tps).unwrap()), E::default())
+    }
+    /// The game's komi, and its opening when one was set.
+    fn with_opening<B: board::TakBoard>(&self, board: B) -> B {
+        let board = board.with_komi(self.komi);
+        match self.double_black_stack {
+            Some(on) => board.with_double_black_stack(on),
+            None => board,
+        }
     }
     // pub fn various_search(&mut self, g: TakGame) {
     //     match g {
@@ -140,6 +151,7 @@ impl std::default::Default for GameInitializer {
             hash_size: 2 << 22,
             max_depth: 128,
             komi: 0,
+            double_black_stack: None,
             num_threads: 1,
             add_noise: false,
             max_nodes: -1,
@@ -398,6 +410,8 @@ pub enum TeiCommand {
     /// is processed, so a worker (spawned once per connection) picks up a komi change when the GUI
     /// switches games without reconnecting. Carries the half-komi value.
     SetKomi(u8),
+    /// The opening, forwarded to the running worker the same way `SetKomi` is.
+    SetDoubleBlackStack(bool),
 }
 
 pub fn execute_moves_check_valid(board: &mut Board6, ptn_slice: &[&str]) -> Result<Vec<GameMove>> {

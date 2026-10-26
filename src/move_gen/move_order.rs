@@ -307,11 +307,13 @@ impl SmartMoveBuffer {
                         0,
                     ));
                 }
-                // "Black stack setup" (double-black-stack variant, komi 0 only): White's first
-                // move places a stack of two (swapped) black flats, encoded with number()==2. In a
-                // standard game (any nonzero komi, e.g. 2-komi) White's opening is a single swapped
-                // flat like Black's. Caps and walls are already excluded at move_num==1 above.
-                let flat_move = if board.move_num() == 1 && side == Color::White && board.komi() == 0
+                // "Black stack setup" (double-black-stack variant): White's first move places a
+                // stack of two (swapped) black flats, encoded with number()==2. In a standard game
+                // White's opening is a single swapped flat like Black's. Caps and walls are already
+                // excluded at move_num==1 above.
+                let flat_move = if board.move_num() == 1
+                    && side == Color::White
+                    && board.double_black_stack()
                 {
                     GameMove::from_placement(Piece::flat(side), idx).set_number(2)
                 } else {
