@@ -62,6 +62,15 @@ pub trait TakBoard:
     where
         Self: Sized;
     fn komi(&self) -> u8;
+    /// Set which opening this game is played under: `true` for double black stack (White's first
+    /// move is a stack of two black flats, written `2a1`), `false` for the standard swap.
+    fn with_double_black_stack(self, on: bool) -> Self
+    where
+        Self: Sized;
+    /// Is White's first move the double-black-stack placement? Unless `with_double_black_stack`
+    /// said otherwise, this follows the original rule that tied the opening to komi: double black
+    /// stack exactly at komi 0. Everything that never sets the opening keeps that behavior.
+    fn double_black_stack(&self) -> bool;
     /// Returns the (half) flat difference for a player
     fn flat_diff(&self, player: Color) -> i32;
     /// Returns a cloned board rotated counter-clockwise in standard orientation
@@ -103,6 +112,7 @@ macro_rules! board_impl {
                     caps_left: [Self::CAPS, Self::CAPS],
                     bits,
                     komi: 0,
+                    double_black_stack: None,
                     fifty_move: 0,
                 }
             }
@@ -387,6 +397,15 @@ macro_rules! board_impl {
 
             fn komi(&self) -> u8 {
                 self.komi
+            }
+
+            fn with_double_black_stack(mut self, on: bool) -> Self {
+                self.double_black_stack = Some(on);
+                self
+            }
+
+            fn double_black_stack(&self) -> bool {
+                self.double_black_stack.unwrap_or(self.komi == 0)
             }
 
             fn flat_diff(&self, player: Color) -> i32 {
@@ -686,6 +705,9 @@ pub struct Board4 {
     caps_left: [usize; 2],
     pub bits: BitboardStorage<<Self as TakBoard>::Bits>,
     komi: u8,
+    /// The opening, when it was set explicitly; `None` falls back to the komi-0 rule (see
+    /// `TakBoard::double_black_stack`).
+    double_black_stack: Option<bool>,
     fifty_move: u8,
 }
 
@@ -698,6 +720,9 @@ pub struct Board5 {
     caps_left: [usize; 2],
     pub bits: BitboardStorage<<Self as TakBoard>::Bits>,
     komi: u8,
+    /// The opening, when it was set explicitly; `None` falls back to the komi-0 rule (see
+    /// `TakBoard::double_black_stack`).
+    double_black_stack: Option<bool>,
     fifty_move: u8,
 }
 
@@ -710,6 +735,9 @@ pub struct Board6 {
     caps_left: [usize; 2],
     pub bits: BitboardStorage<<Self as TakBoard>::Bits>,
     komi: u8,
+    /// The opening, when it was set explicitly; `None` falls back to the komi-0 rule (see
+    /// `TakBoard::double_black_stack`).
+    double_black_stack: Option<bool>,
     fifty_move: u8,
 }
 
@@ -722,6 +750,9 @@ pub struct Board7 {
     caps_left: [usize; 2],
     pub bits: BitboardStorage<<Self as TakBoard>::Bits>,
     komi: u8,
+    /// The opening, when it was set explicitly; `None` falls back to the komi-0 rule (see
+    /// `TakBoard::double_black_stack`).
+    double_black_stack: Option<bool>,
     fifty_move: u8,
 }
 

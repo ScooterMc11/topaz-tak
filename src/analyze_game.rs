@@ -49,6 +49,18 @@
 //! to it. The ply `best` (`BEST_PLY`) stands in for a move where the caller would rather have the
 //! engine's own choice than name one.
 //!
+//! **Which engine searches.** By default, topaz's own search. `--engine-cmd <path>` hands every
+//! search to another engine over TEI instead (`crate::analyze_tei`), behind one seam,
+//! `PositionSearch`: everything this module builds from a search — the board facts, the grading, the
+//! JSON — is the same code whichever engine answered, so another engine's sheet is graded by exactly
+//! the rules a topaz sheet is. The JSON names who searched (`engine`).
+//!
+//! **The opening.** `--opening swap|dbs` says what White's first move is. Without it the board
+//! falls back to the original rule, which tied the opening to komi — double black stack exactly at
+//! komi 0 — and was wrong for a double-black-stack game played with komi and for a swap game played
+//! without. Only ply 1 depends on it, but there it decides the moves the search ranks, the move the
+//! grade compares against, and how an engine's reply is read.
+//!
 //! **Move grading.** Every ply additionally carries the raw numbers a caller needs to award it a
 //! badge — the thresholds themselves live in the bot, so they can be retuned without a rebuild:
 //!   - `loss_cp` — how much worse than the best move, in the mover's frame. Exact when the search
@@ -180,6 +192,7 @@
 //! and off **either side of the ply**, so it also admits the move that settled the game as it was
 //! played.
 
+use crate::analyze_tei::{TeiEngineConfig, TeiSearch};
 use crate::board::{Board4, Board5, Board6, Piece, TakBoard};
 use crate::eval::{Evaluator, LOSE_SCORE, NNUE4, NNUE5, NNUE6, WIN_SCORE};
 use crate::search::{search, SearchInfo};
@@ -197,7 +210,7 @@ const MAX_DEPTH: usize = 32;
 
 /// How far below `WIN_SCORE` still counts as a *proven* win. Win scores are `WIN_SCORE - distance`,
 /// and the distance is bounded by the search depth, so this has plenty of room.
-const SOLVED_MARGIN: i32 = 200;
+pub(crate) const SOLVED_MARGIN: i32 = 200;
 
 /// Win-probability scale. `sigmoid(internal_score / EVAL_SCALE)`, matching the trainer's convention
 /// (`datagen.rs`), i.e. equivalently `sigmoid(human_cp / 100)`.
@@ -353,6 +366,16 @@ pub struct AnalyzeGameConfig {
     /// because nothing in the contract reads them; they exist so multi-depth grading and curve
     /// smoothing can be evaluated offline from one run.
     pub depth_scores: bool,
+    /// The opening the game was played under: `Some(true)` for double black stack, `Some(false)`
+    /// for the standard swap. `None` leaves it to the board's original rule, which ties the opening
+    /// to komi (double black stack exactly at komi 0) — see `TakBoard::double_black_stack`. Only
+    /// ply 1 reads it, but ply 1 reads it everywhere: the moves the search ranks there, the move
+    /// the grade compares against, and the spelling of an engine's reply.
+    pub double_black_stack: Option<bool>,
+    /// Who searches the positions. `None` is topaz's own search; `Some` drives another engine over
+    /// TEI (`crate::analyze_tei`). Nothing else changes with it: the board facts, the grading and
+    /// the JSON are this module's whichever engine answers.
+    pub engine: Option<TeiEngineConfig>,
 }
 
 impl Default for AnalyzeGameConfig {
@@ -370,6 +393,8 @@ impl Default for AnalyzeGameConfig {
             alts_min_decided: 0.0,
             alts_max_loss_pct: f64::INFINITY,
             depth_scores: false,
+            double_black_stack: None,
+            engine: None,
         }
     }
 }
@@ -792,18 +817,18 @@ fn make_info(nodes: u64, table: &HashTable) -> SearchInfo<'_> {
 
 /// A searched position: the score from the **side to move's** perspective, plus the exact scores of
 /// the best root moves (best first), from the same search.
-struct Searched {
-    score: i32,
-    roots: Vec<(GameMove, i32)>,
+pub(crate) struct Searched {
+    pub(crate) score: i32,
+    pub(crate) roots: Vec<(GameMove, i32)>,
     /// The line behind each entry of `roots`, same order (`SearchInfo::multi_pv_lines`). Empty for
     /// a terminal position, and never longer than `roots`.
-    lines: Vec<Vec<GameMove>>,
+    pub(crate) lines: Vec<Vec<GameMove>>,
     /// `(depth, score)` for every fully-completed iteration, ascending. Empty for a terminal
     /// position, which is pinned rather than searched.
-    depths: Vec<(usize, i32)>,
+    pub(crate) depths: Vec<(usize, i32)>,
     /// The principal variation of the deepest iteration — the line the score is *about*, best move
     /// first. Empty for a terminal position.
-    pv: Vec<GameMove>,
+    pub(crate) pv: Vec<GameMove>,
 }
 
 impl Searched {
@@ -904,6 +929,55 @@ where
         lines: info.multi_pv_lines().to_vec(),
         depths: info.depth_scores().to_vec(),
         pv: outcome.map(|o| o.pv).unwrap_or_default(),
+    }
+}
+
+/// How many root moves a search ranks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Breadth {
+    /// Best and second-best — every ordinary search, and all the grading needs (see `make_info`).
+    Grading,
+    /// The `--alts` list: this many root moves, every one of them searched rather than pruned.
+    Alternatives(usize),
+}
+
+/// Where a position's search comes from: topaz's own search (`NativeSearch`), or another engine
+/// over TEI (`crate::analyze_tei::TeiSearch`). Everything that reads the result — the board facts,
+/// the grading, the JSON — is the same code whichever answers, which is the point: a sheet from
+/// another engine is graded by exactly the rules a topaz sheet is.
+pub(crate) trait PositionSearch<B: TakBoard> {
+    /// Search the position on `board`, side to move's frame, leaving the board as it was found.
+    /// Returns the search and the nodes it spent.
+    fn search(&mut self, board: &mut B, breadth: Breadth) -> anyhow::Result<(Searched, u64)>;
+}
+
+/// topaz's own search: one net, one transposition table, cleared before every position.
+struct NativeSearch<'a, E> {
+    eval: E,
+    table: &'a HashTable,
+    info: SearchInfo<'a>,
+    nodes: u64,
+}
+
+impl<'a, B, E> PositionSearch<B> for NativeSearch<'a, E>
+where
+    B: TakBoard,
+    E: Evaluator<Game = B>,
+{
+    fn search(&mut self, board: &mut B, breadth: Breadth) -> anyhow::Result<(Searched, u64)> {
+        Ok(match breadth {
+            Breadth::Grading => {
+                let s = search_position(board, &mut self.eval, &mut self.info);
+                (s, self.info.nodes() as u64)
+            }
+            Breadth::Alternatives(n) => {
+                let mut info = make_info(self.nodes, self.table)
+                    .set_multi_pv(n)
+                    .full_root_moves(true);
+                let s = search_position(board, &mut self.eval, &mut info);
+                (s, info.nodes() as u64)
+            }
+        })
     }
 }
 
@@ -1043,28 +1117,26 @@ fn terminal_value(result: GameResult, player: Color) -> i32 {
 /// without this arm the strongest alternative there can be, the one that simply wins, comes back as
 /// "no answer". The ply that declined it is then ungraded, which on the sheet is a move with no
 /// badge rather than the mistake it was.
-fn alternative_value<B, E>(
+fn alternative_value<B, S>(
     board: &mut B,
-    eval: &mut E,
-    info: &mut SearchInfo,
+    searcher: &mut S,
     alt: GameMove,
     player: Color,
     nodes: &mut u64,
-) -> Option<i32>
+) -> anyhow::Result<Option<i32>>
 where
     B: TakBoard,
-    E: Evaluator<Game = B>,
+    S: PositionSearch<B>,
 {
     let rev = board.do_move(alt);
     let value = match board.game_result() {
-        Some(result) => Some(terminal_value(result, player)),
-        None => {
-            let searched = search_position(board, eval, info);
-            *nodes += info.nodes() as u64;
+        Some(result) => Ok(Some(terminal_value(result, player))),
+        None => searcher.search(board, Breadth::Grading).map(|(searched, spent)| {
+            *nodes += spent;
             // The search scores the position from the *opponent's* view — they are to move there —
             // so `sibling_value` negates it into the mover's.
             sibling_value(&searched)
-        }
+        }),
     };
     board.reverse_move(rev);
     value
@@ -1095,17 +1167,16 @@ struct BestAlt {
 
 /// Play `alt` from the position before the ply, search it on the played move's own terms, and report
 /// what it would have come to. Leaves the board as it found it.
-fn best_alt_outcome<B, E>(
+fn best_alt_outcome<B, S>(
     board: &mut B,
-    eval: &mut E,
-    info: &mut SearchInfo,
+    searcher: &mut S,
     alt: GameMove,
     player: Color,
     nodes: &mut u64,
-) -> BestAlt
+) -> anyhow::Result<BestAlt>
 where
     B: TakBoard,
-    E: Evaluator<Game = B>,
+    S: PositionSearch<B>,
 {
     // Spelled before the move, while the source stack is still intact.
     let display = short_ptn(board, alt);
@@ -1120,17 +1191,22 @@ where
                 GameResult::Draw => false,
             },
         ),
-        None => {
-            let searched = search_position(board, eval, info);
-            *nodes += info.nodes() as u64;
-            // The search scores the position from the *opponent's* view — they are to move there —
-            // so the mover's value is its negation, and a proven win for them is the loss this is
-            // asking about. Same test `solved_loss` applies to the played move.
-            (-searched.score, searched.score >= WIN_SCORE - SOLVED_MARGIN)
-        }
+        None => match searcher.search(board, Breadth::Grading) {
+            Ok((searched, spent)) => {
+                *nodes += spent;
+                // The search scores the position from the *opponent's* view — they are to move
+                // there — so the mover's value is its negation, and a proven win for them is the
+                // loss this is asking about. Same test `solved_loss` applies to the played move.
+                (-searched.score, searched.score >= WIN_SCORE - SOLVED_MARGIN)
+            }
+            Err(e) => {
+                board.reverse_move(rev);
+                return Err(e);
+            }
+        },
     };
     board.reverse_move(rev);
-    BestAlt { display, value, solved_loss }
+    Ok(BestAlt { display, value, solved_loss })
 }
 
 /// The comparison endpoints for a sibling measurement, as `(played, other)`.
@@ -1332,14 +1408,15 @@ fn play_and_measure<B: TakBoard>(
     (facts, rev)
 }
 
-fn analyze_board<B, E>(mut board: B, cfg: &AnalyzeGameConfig) -> anyhow::Result<Analysis>
+fn analyze_board<B, S>(
+    mut board: B,
+    cfg: &AnalyzeGameConfig,
+    searcher: &mut S,
+) -> anyhow::Result<Analysis>
 where
     B: TakBoard,
-    E: Evaluator<Game = B> + Default,
+    S: PositionSearch<B>,
 {
-    let table = HashTable::new(TT_SIZE);
-    let mut eval = E::default();
-    let mut info = make_info(cfg.nodes, &table);
     let mut storage: Vec<GameMove> = Vec::with_capacity(128);
     // Reused across plies: (square, height before the move) for each square a spread drops onto.
     let mut capture_targets: Vec<(usize, u32)> = Vec::with_capacity(8);
@@ -1371,11 +1448,10 @@ where
     // for the ply that *reached* the position, and its root move list grades the ply played *from*
     // it. So the loop carries the previous position's search forward — only the starting position
     // needs an extra one.
-    // `info.nodes()` is this search's own count, not a lifetime total: `SearchInfo::start_search`
-    // resets the stats, so every search's cost is read straight off it and added here.
+    // Every search reports its own node count, not a lifetime total, so each is added here.
     let mut before = {
-        let s = search_position(&mut board, &mut eval, &mut info);
-        nodes += info.nodes() as u64;
+        let (s, spent) = searcher.search(&mut board, Breadth::Grading)?;
+        nodes += spent;
         s
     };
     // Read off the board rather than assumed empty, so `fcd` on the first analyzed ply is right
@@ -1431,14 +1507,10 @@ where
         // already?" number.
         let before_top = before.top();
         let played_best = before.best_move() == Some(mv);
-        let alt_value = cfg
-            .grading
-            .needs_sibling()
-            .then(|| before.best_other_move(mv))
-            .flatten()
-            .and_then(|alt| {
-                alternative_value(&mut board, &mut eval, &mut info, alt, player, &mut nodes)
-            });
+        let alt_value = match cfg.grading.needs_sibling().then(|| before.best_other_move(mv)) {
+            Some(Some(alt)) => alternative_value(&mut board, searcher, alt, player, &mut nodes)?,
+            _ => None,
+        };
 
         // Display PTN, computed before the move while the source stack is still intact.
         let display = short_ptn(&board, mv);
@@ -1519,8 +1591,7 @@ where
             }
             Some(GameResult::Draw) => Searched::terminal(0),
             None => {
-                let s = search_position(&mut board, &mut eval, &mut info);
-                let spent = info.nodes() as u64;
+                let (s, spent) = searcher.search(&mut board, Breadth::Grading)?;
                 search_nodes = Some(spent);
                 nodes += spent;
                 s
@@ -1693,8 +1764,7 @@ where
             if distrust {
                 if let Some(alt) = before.best_other_move(mv) {
                     board.reverse_move(rev_played);
-                    let value =
-                        alternative_value(&mut board, &mut eval, &mut info, alt, player, &mut nodes);
+                    let value = alternative_value(&mut board, searcher, alt, player, &mut nodes)?;
                     board.do_move(mv);
 
                     // A sibling search that came back with nothing leaves the distrusted aligned
@@ -1759,11 +1829,8 @@ where
             && loss_pct <= cfg.alts_max_loss_pct
         {
             board.reverse_move(rev_played);
-            let mut alt_info = make_info(cfg.nodes, &table)
-                .set_multi_pv(cfg.alts)
-                .full_root_moves(true);
-            let searched = search_position(&mut board, &mut eval, &mut alt_info);
-            let alt_nodes = alt_info.nodes() as u64;
+            let (searched, alt_nodes) =
+                searcher.search(&mut board, Breadth::Alternatives(cfg.alts))?;
             nodes += alt_nodes;
 
             let mut played_cp = None;
@@ -1811,16 +1878,15 @@ where
         // Would the best alternative have lost as well? Asked only on the plies where the answer
         // changes something, which is what keeps it to one extra search on one ply in a game or
         // three rather than on every ply of every game.
-        let best_alt = solved_loss
-            .then(|| before.best_other_move(mv))
-            .flatten()
-            .map(|alt| {
+        let best_alt = match solved_loss.then(|| before.best_other_move(mv)) {
+            Some(Some(alt)) => {
                 board.reverse_move(rev_played);
-                let out =
-                    best_alt_outcome(&mut board, &mut eval, &mut info, alt, player, &mut nodes);
+                let out = best_alt_outcome(&mut board, searcher, alt, player, &mut nodes)?;
                 board.do_move(mv);
-                out
-            });
+                Some(out)
+            }
+            _ => None,
+        };
 
         if !cfg.quiet {
             eprintln!(
@@ -1891,6 +1957,18 @@ fn move_top_str(p: Piece) -> &'static str {
     } else {
         "flat"
     }
+}
+
+/// A string for a JSON string literal. PTN never needs it; an engine's self-reported name might.
+fn json_escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            c if (c as u32) < 0x20 => vec![' '],
+            c => vec![c],
+        })
+        .collect()
 }
 
 fn result_str(r: GameResult) -> &'static str {
@@ -1979,7 +2057,7 @@ fn grade_json(g: &Grade) -> String {
     )
 }
 
-fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
+fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!(
@@ -1988,6 +2066,15 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis) -> String {
         cfg.half_komi,
         cfg.half_komi as f64 / 2.0,
         cfg.nodes
+    ));
+    // Who searched, by the name the caller gave it (topaz when nobody else did), and how it
+    // identified itself: the TEI `id name` line, version included, which is the nearest thing to a
+    // build that the protocol carries.
+    let engine_name = cfg.engine.as_ref().map_or("topaz", |e| e.name.as_str());
+    s.push_str(&format!(
+        "  \"engine\": {{\"name\": \"{}\", \"id\": \"{}\"}},\n",
+        json_escape(engine_name),
+        json_escape(engine_id)
     ));
     s.push_str(&format!(
         "  \"result\": {},\n",
@@ -2134,20 +2221,70 @@ fn start_board<B: TakBoard>(cfg: &AnalyzeGameConfig) -> anyhow::Result<B> {
         Some(tps) => B::try_from_tps(tps.trim())?,
         None => B::start_position(),
     };
-    Ok(board.with_komi(cfg.half_komi))
+    let board = board.with_komi(cfg.half_komi);
+    Ok(match cfg.double_black_stack {
+        Some(on) => board.with_double_black_stack(on),
+        None => board,
+    })
+}
+
+/// A whole game on topaz's own search.
+fn analyze_native<B, E>(cfg: &AnalyzeGameConfig) -> anyhow::Result<Analysis>
+where
+    B: TakBoard,
+    E: Evaluator<Game = B> + Default,
+{
+    let table = HashTable::new(TT_SIZE);
+    let mut searcher = NativeSearch {
+        eval: E::default(),
+        table: &table,
+        info: make_info(cfg.nodes, &table),
+        nodes: cfg.nodes,
+    };
+    analyze_board(start_board::<B>(cfg)?, cfg, &mut searcher)
+}
+
+/// A whole game with another engine doing the searching, over TEI. Returns the engine's own
+/// `id name` alongside the analysis.
+fn analyze_tei<B: TakBoard>(
+    cfg: &AnalyzeGameConfig,
+    engine: &TeiEngineConfig,
+) -> anyhow::Result<(Analysis, String)> {
+    let board = start_board::<B>(cfg)?;
+    let mut searcher = TeiSearch::start(
+        engine,
+        B::SIZE,
+        cfg.half_komi,
+        board.double_black_stack(),
+        cfg.nodes,
+        cfg.quiet,
+    )?;
+    let analysis = analyze_board(board, cfg, &mut searcher)?;
+    Ok((analysis, searcher.id().to_string()))
 }
 
 pub fn run(cfg: AnalyzeGameConfig) -> anyhow::Result<()> {
     if cfg.plies.is_empty() {
         anyhow::bail!("no plies given");
     }
-    let analysis = match cfg.size {
-        4 => analyze_board::<Board4, NNUE4>(start_board(&cfg)?, &cfg)?,
-        5 => analyze_board::<Board5, NNUE5>(start_board(&cfg)?, &cfg)?,
-        6 => analyze_board::<Board6, NNUE6>(start_board(&cfg)?, &cfg)?,
-        n => anyhow::bail!("unsupported board size {n} (nets exist for 4x4, 5x5 and 6x6)"),
+    let (analysis, engine_id) = match &cfg.engine {
+        None => {
+            let analysis = match cfg.size {
+                4 => analyze_native::<Board4, NNUE4>(&cfg)?,
+                5 => analyze_native::<Board5, NNUE5>(&cfg)?,
+                6 => analyze_native::<Board6, NNUE6>(&cfg)?,
+                n => anyhow::bail!("unsupported board size {n} (nets exist for 4x4, 5x5 and 6x6)"),
+            };
+            (analysis, "topaz".to_string())
+        }
+        Some(engine) => match cfg.size {
+            4 => analyze_tei::<Board4>(&cfg, engine)?,
+            5 => analyze_tei::<Board5>(&cfg, engine)?,
+            6 => analyze_tei::<Board6>(&cfg, engine)?,
+            n => anyhow::bail!("unsupported board size {n}"),
+        },
     };
-    let json = to_json(&cfg, &analysis);
+    let json = to_json(&cfg, &analysis, &engine_id);
     match &cfg.output {
         Some(path) => std::fs::write(path, &json)?,
         None => {

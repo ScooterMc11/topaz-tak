@@ -273,6 +273,30 @@ pub fn main() {
                 "depth-scores",
                 "Attach every completed iteration's score to each ply (diagnostic; costs nothing)",
             );
+            opts.optopt(
+                "",
+                "opening",
+                "The opening the game was played under: swap or dbs (double black stack). Default:                  the old rule, double black stack exactly at half-komi 0",
+                "OPENING",
+            );
+            opts.optopt(
+                "",
+                "engine-cmd",
+                "Search with this TEI engine instead of topaz's own search",
+                "PATH",
+            );
+            opts.optopt(
+                "",
+                "engine-name",
+                "What to call the --engine-cmd engine in the JSON (default: its file name)",
+                "NAME",
+            );
+            opts.optmulti(
+                "",
+                "engine-opt",
+                "A setoption for the --engine-cmd engine, e.g. HumanWDL=true (repeatable)",
+                "NAME=VALUE",
+            );
             opts.optflag("q", "quiet", "Suppress per-ply progress on stderr");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
@@ -335,6 +359,35 @@ pub fn main() {
                     .opt_get_default("alts-max-loss", default.alts_max_loss_pct)
                     .unwrap(),
                 depth_scores: matches.opt_present("depth-scores"),
+                double_black_stack: match matches.opt_str("opening").as_deref() {
+                    None => None,
+                    Some("swap") => Some(false),
+                    Some("dbs") | Some("double black stack") => Some(true),
+                    Some(other) => {
+                        eprintln!("analyzegame: unknown opening '{other}' (swap or dbs)");
+                        std::process::exit(1);
+                    }
+                },
+                engine: matches.opt_str("engine-cmd").map(|command| {
+                    let name = matches.opt_str("engine-name").unwrap_or_else(|| {
+                        std::path::Path::new(&command)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| command.clone())
+                    });
+                    let options = matches
+                        .opt_strs("engine-opt")
+                        .iter()
+                        .map(|kv| match kv.split_once('=') {
+                            Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+                            None => {
+                                eprintln!("analyzegame: --engine-opt wants NAME=VALUE, got '{kv}'");
+                                std::process::exit(1);
+                            }
+                        })
+                        .collect();
+                    topaz_tak::analyze_tei::TeiEngineConfig { command, name, options }
+                }),
             };
             if let Err(e) = topaz_tak::analyze_game::run(cfg) {
                 eprintln!("analyzegame: {e}");
@@ -1521,6 +1574,10 @@ fn play_game_tei<E: Evaluator + Default + Send>(
                     }
                 }
             }
+            TeiCommand::SetDoubleBlackStack(on) => {
+                // Like komi: applied to init, and the next Position rebuilds the board with it.
+                init.double_black_stack = Some(on);
+            }
             TeiCommand::SetKomi(k) => {
                 // Applied to init; the next Position rebuilds the board with this komi, so the
                 // subsequent search selects the matching net and opening rule.
@@ -1553,6 +1610,8 @@ fn identify() {
     println!("id name Topaz");
     println!("id author Justin Kur");
     println!("option name HalfKomi type spin default 0 min 0 max 12");
+    // Unset, the opening follows komi (double black stack exactly at 0); set, it is what it says.
+    println!("option name DoubleBlackStack type check default false");
     println!("option name Threads type spin default 1 min 1 max 8");
     println!("option name Hash type spin default 8 min 1 max 1024");
     println!("option name MaxNodes type spin default -1 min -1 max 10000000");
@@ -1628,6 +1687,11 @@ fn tei_loop() {
                 // Forward to the already-spawned worker so an in-UI game switch (no reconnect)
                 // updates komi -> net + opening rule, instead of reusing the previous game's.
                 sender.send(TeiCommand::SetKomi(init.komi)).ok();
+            } else if name == "DoubleBlackStack" {
+                let on: bool = value.parse().unwrap();
+                init.double_black_stack = Some(on);
+                println!("Setting DoubleBlackStack to {}", on);
+                sender.send(TeiCommand::SetDoubleBlackStack(on)).ok();
             } else if name == "Threads" {
                 init.num_threads = value.parse().unwrap();
                 println!("Setting threads to {}", init.num_threads);
