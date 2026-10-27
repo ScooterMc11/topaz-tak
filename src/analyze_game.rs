@@ -100,6 +100,14 @@
 //!     `display` is its first move. Every position gets one for free — it is where `sharp_cp` comes
 //!     from, and multi-PV builds a line per index whether or not anyone keeps it — so unlike `alts`
 //!     it is not gated. `null` on a terminal ply and in a position with one move to make.
+//!   - `mate` — set when the ply's score is a *proven* win, `{winner, plies, kind}`: who has it,
+//!     how many plies until it lands (counted from the position the ply reached, so 1 means the
+//!     side to move wins with its next move), and `"road"` or `"flats"` for how. The kind is read
+//!     by replaying the line to the end of the game, searching on from wherever the table's PV ran
+//!     out (see `mate_of`), and that finished line is what `pv` then reports. A line that still
+//!     stops short leaves `kind` null, and so does one whose ending disagrees with the score.
+//!     `runner_up` carries one on the same terms. Every engine reports a proof as
+//!     `WIN_SCORE - distance`, so this is engine-agnostic.
 //!   - `search_nodes` — how many nodes that search actually spent. `nodes_per_ply` is the *budget*;
 //!     this is the bill, and the two differ whenever the search stopped early — a solved position,
 //!     or an iteration that finished under the cap. `null` on a terminal ply, which is pinned
@@ -554,6 +562,29 @@ struct RunnerUp {
     /// The line behind it, in short PTN, on the same terms as the ply's own `pv` — replayed on the
     /// board so the spelling and crush flags are right, and truncated at anything unplayable.
     pv: Vec<String>,
+    /// Set when `score_white` is a proven win, on the same terms as the ply's own `mate`.
+    mate: Option<Mate>,
+}
+
+/// How a proven win ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MateKind {
+    Road,
+    Flats,
+}
+
+/// A proven win, as a reader wants it said: who has it, how far away it is, and how it ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Mate {
+    winner: Color,
+    /// Plies from the position the score was read in to the one the game ends in — so 1 is the
+    /// side to move winning with its next move. `WIN_SCORE - |score|`, which is how every engine
+    /// here encodes a proof (topaz natively, and `analyze_tei` maps a TEI `mate n` onto it).
+    plies: u32,
+    /// `None` when the line the search reported stops short of the end of the game, or ends it some
+    /// other way than the score says — the distance is the search's own, but *how* is read off the
+    /// line, and a line that doesn't get there cannot say.
+    kind: Option<MateKind>,
 }
 
 /// One analyzed ply.
@@ -632,6 +663,9 @@ struct PlyAnalysis {
     /// The second-best move in that same position, from that same search. `None` for a terminal
     /// ply, and for a position with only one move to make.
     runner_up: Option<RunnerUp>,
+    /// Set when `score_white` is a proven win: who has it, how many plies off, and how it ends.
+    /// `None` on a terminal ply — the game is over, not about to be.
+    mate: Option<Mate>,
     /// Deepest fully-completed iteration of the search of the position this ply reached. `None` for
     /// a terminal ply, which is pinned rather than searched. The grading compares against the ply
     /// *before*, so a position that searched much shallower than its predecessor drags the whole
@@ -1020,6 +1054,77 @@ fn pv_ptn<B: TakBoard>(board: &mut B, pv: &[GameMove]) -> Vec<String> {
         board.reverse_move(rev);
     }
     out
+}
+
+/// Read a proven win off a White-frame score, and how it ends off the line behind it.
+///
+/// The distance comes from the score, which is the search's own claim; the kind comes from playing
+/// `pv` out on the board the score was read in and looking at how the game ended.
+///
+/// **A PV routinely stops short of the end**, because it is read back out of a transposition table
+/// that has already overwritten the tail: Syntaks's line for the road in 3 of PlayTak 878681 16B is
+/// two moves long, and topaz's own lines on the flat win of 812697 lose a move or two the same way.
+/// So where the line runs out before the game does, `more` is asked to search the position it ran
+/// out in — the engine that proved the win, continuing its own line — and the walk carries on from
+/// what comes back. A proven win a few plies off is the cheapest thing a search ever solves, and this
+/// only happens on plies that carry one. It is asked at most once per ply the score says is left,
+/// and a walk that has gone that far without the game ending stops there.
+///
+/// A line that still stops short, or that ends the game in the other player's favour or in a draw,
+/// leaves the kind unknown rather than guessed. The board is left as it was found.
+///
+/// Returns the line as walked, too — `pv` with whatever `more` added, up to where the walk stopped —
+/// so a caller can show the win all the way to the end rather than the stub the table kept.
+fn mate_of<B: TakBoard>(
+    board: &mut B,
+    score_white: i32,
+    pv: &[GameMove],
+    more: &mut dyn FnMut(&mut B) -> anyhow::Result<Vec<GameMove>>,
+) -> anyhow::Result<(Option<Mate>, Vec<GameMove>)> {
+    if !is_solved(score_white) || !is_real_score(score_white) {
+        return Ok((None, pv.to_vec()));
+    }
+    let winner = if score_white > 0 { Color::White } else { Color::Black };
+    let plies = (WIN_SCORE - score_white.abs()).max(1) as u32;
+    let mut line: Vec<GameMove> = pv.to_vec();
+    let mut played: Vec<RevGameMove> = Vec::with_capacity(plies as usize);
+    let mut asked = 0;
+    let mut kind = None;
+    let walked = (|| -> anyhow::Result<()> {
+        while (played.len() as u32) < plies {
+            if played.len() == line.len() {
+                if asked == plies {
+                    break;
+                }
+                asked += 1;
+                let rest = more(board)?;
+                if rest.is_empty() {
+                    break;
+                }
+                line.extend(rest);
+            }
+            let mv = line[played.len()];
+            if !board.legal_move(mv) {
+                break;
+            }
+            played.push(board.do_move(mv));
+            if let Some(result) = board.game_result() {
+                if result == GameResult::win_by(winner) {
+                    kind = Some(if board.road(winner) { MateKind::Road } else { MateKind::Flats });
+                }
+                break;
+            }
+        }
+        Ok(())
+    })();
+    // Past the original line, keep only what was actually played: an extension can bring back moves
+    // beyond where the walk stopped. Within it, keep everything, as `pv_ptn` would have.
+    line.truncate(played.len().max(pv.len()));
+    while let Some(rev) = played.pop() {
+        board.reverse_move(rev);
+    }
+    walked?;
+    Ok((Some(Mate { winner, plies, kind }), line))
 }
 
 /// Grade a ply by comparing the parent at depth `D` against the child at depth `D-1`, which put the
@@ -1598,22 +1703,6 @@ where
             }
         };
 
-        // The line the search was looking at, read from the position this ply *reached* — so it is
-        // the engine's answer to "and then what?", with its recommended reply first. Taken here,
-        // while the board still sits on that position and before the regrade below borrows it back.
-        let pv = pv_ptn(&mut board, &after.pv);
-
-        // ...and the other line that search looked at. Same position, same search, same depth, so
-        // its score needs no alignment against `score_white` below — the two are the best and
-        // second-best readings of one position. Spelled here for the same reason the PV is: the
-        // board is standing on the position these moves are played in, which is what `short_ptn`
-        // and `pv_ptn` need to get the count and the crush flag right.
-        let runner_up = after.runner_up().map(|(mv, cp, line)| RunnerUp {
-            display: short_ptn(&board, mv),
-            score_white: to_white_frame(&board, cp),
-            pv: pv_ptn(&mut board, line),
-        });
-
         let (score_white, win_prob_white) = match terminal {
             Some(GameResult::WhiteWin) => (i32::MAX, 1.0),
             Some(GameResult::BlackWin) => (i32::MIN, 0.0),
@@ -1628,6 +1717,47 @@ where
             }
         };
         result = terminal;
+
+        // A proof's line finished off by the engine that proved it, where the table lost the end of
+        // it (`mate_of`). Same searcher, same budget; what it spends is counted like any search.
+        let mut finish = |b: &mut B| -> anyhow::Result<Vec<GameMove>> {
+            let (s, spent) = searcher.search(b, Breadth::Grading)?;
+            nodes += spent;
+            Ok(s.pv)
+        };
+
+        // A proof is read off the same score as the bar, while the board still stands on the
+        // position it describes. Never on a terminal ply: that game is over, not about to be.
+        let (mate, line) = if terminal.is_none() {
+            mate_of(&mut board, score_white, &after.pv, &mut finish)?
+        } else {
+            (None, after.pv.clone())
+        };
+
+        // The line the search was looking at, read from the position this ply *reached* — so it is
+        // the engine's answer to "and then what?", with its recommended reply first — and, on a
+        // proven win, carried on to the end of the game. Taken here, while the board still sits on
+        // that position and before the regrade below borrows it back.
+        let pv = pv_ptn(&mut board, &line);
+
+        // ...and the other line that search looked at. Same position, same search, same depth, so
+        // its score needs no alignment against `score_white` — the two are the best and
+        // second-best readings of one position. Spelled here for the same reason the PV is: the
+        // board is standing on the position these moves are played in, which is what `short_ptn`
+        // and `pv_ptn` need to get the count and the crush flag right.
+        let runner_up = match after.runner_up() {
+            Some((mv, cp, line)) => {
+                let score_white = to_white_frame(&board, cp);
+                let (mate, line) = mate_of(&mut board, score_white, line, &mut finish)?;
+                Some(RunnerUp {
+                    display: short_ptn(&board, mv),
+                    score_white,
+                    pv: pv_ptn(&mut board, &line),
+                    mate,
+                })
+            }
+            None => None,
+        };
 
         // The same iteration-by-iteration record `align` grades from, put on the sheet's fixed White
         // footing so a consumer can replay any pairing depth (or any smoothing of the curve) without
@@ -1921,6 +2051,7 @@ where
             largest_capture_after,
             pv,
             runner_up,
+            mate,
             search_depth: after.deepest(),
             search_nodes,
             // Already computed above: the `--alts` gate reads it too.
@@ -2038,6 +2169,25 @@ fn alts_json(a: &Alternatives) -> String {
 }
 
 /// One grading method's numbers, in human cp. `raw_cp` is the unclamped comparison — see `Grade`.
+fn mate_json(m: Option<&Mate>) -> String {
+    m.map(|m| {
+        format!(
+            "{{\"winner\": \"{}\", \"plies\": {}, \"kind\": {}}}",
+            match m.winner {
+                Color::White => "white",
+                Color::Black => "black",
+            },
+            m.plies,
+            match m.kind {
+                Some(MateKind::Road) => "\"road\"",
+                Some(MateKind::Flats) => "\"flats\"",
+                None => "null",
+            }
+        )
+    })
+    .unwrap_or_else(|| "null".to_string())
+}
+
 fn grade_json(g: &Grade) -> String {
     format!(
         "{{\"loss_cp\": {:.2}, \"raw_cp\": {:.2}, \"exact\": {}, \"sharp_cp\": {}, \
@@ -2099,7 +2249,7 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
              \"loss_cp\": {:.2}, \
              \"loss_exact\": {}, \"sharp_cp\": {}, \"fcd\": {}, \"ocs_added\": {}, \
              \"move_top\": {}, \"largest_capture\": {}, \"largest_capture_after\": {}, \
-             \"pv\": [{}], \"runner_up\": {}, \
+             \"pv\": [{}], \"runner_up\": {}, \"mate\": {}, \
              \"cp_before\": {:.2}, \
              \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \
              \"win_prob_before\": {:.6}, \
@@ -2144,12 +2294,14 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
             p.runner_up
                 .as_ref()
                 .map(|r| format!(
-                    "{{\"display\": \"{}\", \"cp_white\": {:.2}, \"pv\": [{}]}}",
+                    "{{\"display\": \"{}\", \"cp_white\": {:.2}, \"pv\": [{}], \"mate\": {}}}",
                     r.display,
                     r.score_white as f64 / 4.0,
-                    r.pv.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ")
+                    r.pv.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", "),
+                    mate_json(r.mate.as_ref())
                 ))
                 .unwrap_or_else(|| "null".to_string()),
+            mate_json(p.mate.as_ref()),
             g.cp_before as f64 / 4.0,
             g.cmp_played as f64 / 4.0,
             g.cmp_other as f64 / 4.0,
@@ -2300,6 +2452,64 @@ pub fn run(cfg: AnalyzeGameConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Position;
+
+    /// White has a1-e1 and f1 to come: a road in one, White to move.
+    const ROAD_IN_ONE: &str = "2,2,2,2,x2/x6/x6/x6/x6/1,1,1,1,1,x 1 5";
+
+    /// A `more` with nothing to add.
+    fn nothing(_: &mut Board6) -> anyhow::Result<Vec<GameMove>> {
+        Ok(Vec::new())
+    }
+
+    fn mate(board: &mut Board6, score: i32, pv: &[GameMove]) -> Option<Mate> {
+        mate_of(board, score, pv, &mut nothing).unwrap().0
+    }
+
+    #[test]
+    fn a_mate_reads_its_distance_off_the_score_and_its_ending_off_the_line() {
+        let mut board = Board6::try_from_tps(ROAD_IN_ONE).unwrap();
+        let f1 = GameMove::try_from_ptn("f1", &board).unwrap();
+        let m = mate(&mut board, WIN_SCORE - 1, &[f1]).unwrap();
+        assert_eq!(m, Mate { winner: Color::White, plies: 1, kind: Some(MateKind::Road) });
+        // The line is played back off the board, not left on it.
+        assert!(board.game_result().is_none());
+        assert_eq!(board.side_to_move(), Color::White);
+    }
+
+    #[test]
+    fn a_line_that_stops_short_leaves_the_ending_unknown() {
+        let mut board = Board6::try_from_tps(ROAD_IN_ONE).unwrap();
+        assert_eq!(mate(&mut board, WIN_SCORE - 1, &[]).unwrap().kind, None);
+        // ...and so does a line that ends the game for the other side than the score says.
+        let f1 = GameMove::try_from_ptn("f1", &board).unwrap();
+        assert_eq!(mate(&mut board, LOSE_SCORE + 1, &[f1]).unwrap().kind, None);
+    }
+
+    #[test]
+    fn a_line_that_stops_short_is_finished_by_searching_where_it_stopped() {
+        let mut board = Board6::try_from_tps(ROAD_IN_ONE).unwrap();
+        let f1 = GameMove::try_from_ptn("f1", &board).unwrap();
+        let mut asked = 0;
+        let mut more = |b: &mut Board6| -> anyhow::Result<Vec<GameMove>> {
+            asked += 1;
+            assert_eq!(b.side_to_move(), Color::White, "asked from where the line ran out");
+            Ok(vec![f1])
+        };
+        let (m, line) = mate_of(&mut board, WIN_SCORE - 1, &[], &mut more).unwrap();
+        assert_eq!(m.unwrap().kind, Some(MateKind::Road));
+        assert_eq!(line, vec![f1], "the finished line comes back for the PV");
+        assert_eq!(asked, 1);
+        assert!(board.game_result().is_none());
+    }
+
+    #[test]
+    fn an_evaluation_is_not_a_mate() {
+        let mut board = Board6::try_from_tps(ROAD_IN_ONE).unwrap();
+        assert_eq!(mate(&mut board, 3000, &[]), None);
+        assert_eq!(mate(&mut board, -(WIN_SCORE - SOLVED_MARGIN) + 1, &[]), None);
+        assert_eq!(mate(&mut board, -(WIN_SCORE - 4), &[]).unwrap().winner, Color::Black);
+    }
 
     /// An aligned grade with the two readings a `distrust_aligned` decision turns on: what the
     /// parent was worth at the comparison depth, and what the played move was worth one below it.
