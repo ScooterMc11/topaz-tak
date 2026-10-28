@@ -26,8 +26,8 @@
 //! except for the moves that come *back*, and those are parsed against topaz's own board (crush flags
 //! inferred, legality checked) the same way a ply from a PTN is.
 //!
-//! **Scores go through the engine's own win probability.** Every gate in `analyze_game` (the drift
-//! guard, the `--alts` gate, the solved test) and every threshold in Takana reads topaz's scale,
+//! **Scores go through the engine's own win probability.** Every gate in `analyze_game` (the
+//! `--alts` gate, the solved test) and every threshold in Takana reads topaz's scale,
 //! `sigmoid(internal / 400)`. Each info line's `wdl` is read as an expected score, `(W + D/2) /
 //! (W + D + L)`, and mapped back onto that scale as `400 · logit(p)`, so another engine's 60% sits
 //! exactly where topaz's 60% does. A line without `wdl` falls back to its `cp` read as human cp

@@ -242,12 +242,6 @@ pub fn main() {
             opts.optopt("f", "file", "Read plies from a PTN file", "PATH");
             opts.optopt("o", "output", "JSON output path (default stdout)", "PATH");
             opts.optopt(
-                "g",
-                "grading",
-                "Loss measurement: aligned (default, 1 search/ply), sibling (2), both",
-                "MODE",
-            );
-            opts.optopt(
                 "",
                 "alts",
                 "Also report the position's N best root moves per ply, with their grading numbers \
@@ -337,16 +331,6 @@ pub fn main() {
             }
             // Tolerate a whole PTN body: drop headers, comments, move numbers and the result token.
             let plies = parse_ply_list(&ply_text);
-            let grading = match matches.opt_str("g") {
-                Some(text) => match topaz_tak::analyze_game::Grading::parse(&text) {
-                    Some(g) => g,
-                    None => {
-                        eprintln!("analyzegame: unknown grading mode '{text}'");
-                        std::process::exit(1);
-                    }
-                },
-                None => default.grading,
-            };
             let tps = matches.opt_str("t");
             // A TPS names its own board size, so `-s` is only needed without one.
             let size = match (matches.opt_str("s"), &tps) {
@@ -364,7 +348,6 @@ pub fn main() {
                 plies,
                 output: matches.opt_str("o"),
                 quiet: matches.opt_present("q"),
-                grading,
                 alts: matches.opt_get_default("alts", default.alts).unwrap(),
                 alts_min_decided: matches
                     .opt_get_default("alts-min-decided", default.alts_min_decided)
