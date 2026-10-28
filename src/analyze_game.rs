@@ -198,7 +198,9 @@
 //! the caller has already said it will ignore. Note that the first is read off the **leader's** win
 //! probability rather than the mover's, so it admits both players' moves out of a settled position,
 //! and off **either side of the ply**, so it also admits the move that settled the game as it was
-//! played.
+//! played. `--alts-max-fcd` and `--alts-min-ocs` are a third gate, on the move itself: a caller
+//! that only reads the list for moves it might call rare can say which moves never are, and in a
+//! settled game — where the first gate admits nearly every ply — that is most of them.
 
 use crate::analyze_tei::{TeiEngineConfig, TeiSearch};
 use crate::board::{Board4, Board5, Board6, Piece, TakBoard};
@@ -369,6 +371,12 @@ pub struct AnalyzeGameConfig {
     /// normalised footing the caller grades on (`loss_cp` against `cp_before`). A ply the loss
     /// method could not grade at all never qualifies.
     pub alts_max_loss_pct: f64,
+    /// ...and, when set, only **stack movements** that gave up flat count down to `max_fcd` or left
+    /// at least `min_ocs` of the squares they touched with the opponent (`fcd`, `ocs_added`) —
+    /// either will do. A caller that scores rarity off those two numbers and calls a move that
+    /// moved nothing, or did neither, ordinary whatever else it did, has no use for that move's
+    /// alternatives. `None` admits every ply. The caller's thresholds, not the engine's.
+    pub alts_irregular: Option<AltsIrregular>,
     /// Attach every fully-completed iteration's score to each ply (`depth_scores`), as a diagnostic.
     /// Free — the search already records them (`SearchInfo::depth_scores`) — but off by default
     /// because nothing in the contract reads them; they exist so multi-depth grading and curve
@@ -400,10 +408,26 @@ impl Default for AnalyzeGameConfig {
             alts: 0,
             alts_min_decided: 0.0,
             alts_max_loss_pct: f64::INFINITY,
+            alts_irregular: None,
             depth_scores: false,
             double_black_stack: None,
             engine: None,
         }
+    }
+}
+
+/// The move-shape gate on `--alts` — see `AnalyzeGameConfig::alts_irregular`.
+#[derive(Debug, Clone, Copy)]
+pub struct AltsIrregular {
+    /// A spread that moved the mover's flat lead (`fcd`) by at most this much qualifies.
+    pub max_fcd: i32,
+    /// ...as does one that left at least this many of its squares topped by the opponent.
+    pub min_ocs: u32,
+}
+
+impl AltsIrregular {
+    fn admits(&self, move_top: Option<Piece>, fcd: i32, ocs_added: u32) -> bool {
+        move_top.is_some() && (fcd <= self.max_fcd || ocs_added >= self.min_ocs)
     }
 }
 
@@ -1957,6 +1981,9 @@ where
         let alts = if cfg.alts > 0
             && decided >= cfg.alts_min_decided
             && loss_pct <= cfg.alts_max_loss_pct
+            && cfg
+                .alts_irregular
+                .map_or(true, |gate| gate.admits(move_top, fcd, ocs_added))
         {
             board.reverse_move(rev_played);
             let (searched, alt_nodes) =

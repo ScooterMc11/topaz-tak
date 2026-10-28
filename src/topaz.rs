@@ -268,6 +268,20 @@ pub fn main() {
                 "Gate --alts to plies that gave up at most this many win percentage points",
                 "PCT",
             );
+            opts.optopt(
+                "",
+                "alts-max-fcd",
+                "Gate --alts to stack movements that moved the mover's flat lead by at most F \
+                 (fcd), or (with --alts-min-ocs) left at least N touched squares with the \
+                 opponent. Either flag turns the gate on; one left out is a condition never met",
+                "F",
+            );
+            opts.optopt(
+                "",
+                "alts-min-ocs",
+                "See --alts-max-fcd",
+                "N",
+            );
             opts.optflag(
                 "",
                 "depth-scores",
@@ -358,6 +372,16 @@ pub fn main() {
                 alts_max_loss_pct: matches
                     .opt_get_default("alts-max-loss", default.alts_max_loss_pct)
                     .unwrap(),
+                alts_irregular: {
+                    let max_fcd: Option<i32> = matches.opt_get("alts-max-fcd").unwrap();
+                    let min_ocs: Option<u32> = matches.opt_get("alts-min-ocs").unwrap();
+                    (max_fcd.is_some() || min_ocs.is_some()).then(|| {
+                        topaz_tak::analyze_game::AltsIrregular {
+                            max_fcd: max_fcd.unwrap_or(i32::MIN),
+                            min_ocs: min_ocs.unwrap_or(u32::MAX),
+                        }
+                    })
+                },
                 depth_scores: matches.opt_present("depth-scores"),
                 double_black_stack: match matches.opt_str("opening").as_deref() {
                     None => None,
