@@ -63,15 +63,17 @@
 //!
 //! **Move grading.** Every ply additionally carries the raw numbers a caller needs to award it a
 //! badge — the thresholds themselves live in the bot, so they can be retuned without a rebuild:
-//!   - `loss_cp` — how much worse than the best move, in the mover's frame. Exact when the search
-//!     graded the move itself (`loss_exact`), otherwise inferred from the position it reached.
-//!     **A diagnostic, not the grading input** — see `cmp_played_cp` below for what to grade on.
+//!   - `loss_cp` — how far the bar fell across the ply, in the mover's frame (see *How the loss is
+//!     measured* below). `loss_exact` is false only when one of the two positions had no completed
+//!     search to read. **A diagnostic, not the grading input** — see `cmp_played_cp` below for what
+//!     to grade on.
 //!   - `cmp_played_cp` / `cmp_other_cp` — the two ends of that comparison, in the mover's frame and
 //!     on one footing: the played move, and the move it was measured against (the best move, or the
 //!     runner-up when the ply *was* the best move). Normalise both into win probability and subtract
-//!     *there*. Subtracting them as cp is the one thing they must not be used for: a sibling
-//!     re-search can prove a win the parent's search never saw, and a mate score minus an evaluation
-//!     is not a quantity. See `Grade::cmp_played` for why `cp_before - loss_cp` cannot stand in.
+//!     *there*. Subtracting them as cp is the one thing they must not be used for: the bar on one
+//!     side of a ply can be a proven win and on the other an evaluation, and a mate score minus an
+//!     evaluation is not a quantity. See `Grade::cmp_played` for why `cp_before - loss_cp` cannot
+//!     stand in.
 //!   - `sharp_cp` — how much *better* than the best alternative to it. Negative whenever some other
 //!     move was better, so "the only good move here" is simply a large positive value.
 //!   - `fcd` — flat-count differential: how far the ply moved the mover's flat lead.
@@ -113,78 +115,35 @@
 //!     or an iteration that finished under the cap. `null` on a terminal ply, which is pinned
 //!     rather than searched.
 //!
-//! **How the loss is measured** (`Grading`). Two methods, because the obvious one is wrong:
+//! **How the loss is measured: off the bar.** A ply's loss is how far the sheet's own evaluation bar
+//! fell across it, in the mover's frame — the position before the ply against the position it
+//! reached, each read exactly as the bar draws it (`Searched::smoothed`). So a badge and the bar
+//! beside it cannot disagree: a Blunder is a bar that fell by the Blunder band, and a move whose bar
+//! rose gave nothing up. Every position is searched once, and that one search is both the bar for the
+//! ply that reached it and the reference for the ply played from it (`bar_grade`).
 //!
-//! *Naive.* Difference a position's score against its child's. This does not work: the child search
-//! sees a ply deeper, so the two scores have different horizons. Measured on plies the engine itself
-//! picked — where the true loss is zero by definition — this showed swings of up to 27cp, enough to
-//! badge a top move a blunder.
+//! Two plies are read differently. One that **was** the engine's own best move gives up nothing by
+//! definition, so its loss is pinned to 0 and it is compared against the runner-up instead — the
+//! gap `sharp_cp` reports, which multi-PV 2 returns with exact scores from the same search, at the
+//! same depth and for the same side to move, so it needs no extra search. And one that ended the
+//! game is compared against its pinned result, which is what the bar draws for it too.
 //!
-//! *`Grading::Sibling`* (the original fix). Search the position the ply reached and the position the
-//! *best* move would have reached, and compare those. Two children of the same parent, same budget,
-//! same side to move, so the horizons match. Correct, but it doubles the searches.
+//! **What this replaced: depth alignment.** The loss used to pair the parent at depth `D` against the
+//! child at `D-1`, on the reasoning that a position and the next one only look equally far down the
+//! tree at matched horizons, and fell back to searching the best alternative as a sibling whenever
+//! that pairing disagreed with the child's own deeper reading (about a tenth of plies). It left the
+//! badge and the bar on different readings — 0.65 win points apart on an average ply that was not the
+//! best move, and up to 13 — and the fallback searches cost about 12% of a run's nodes. Measured on
+//! eight games at 200k nodes/ply against two 800k references (one searched forward, one backward),
+//! grading off the bar is as accurate: mean error 1.07 / 1.18 win points against 1.05 / 1.17, band
+//! agreement 79.3% / 77.4% against 78.8% / 77.6%, and a badge mix all but unchanged.
 //!
-//! *`Grading::Aligned`* (the default). The horizon mismatch is a *parity* problem, not an inherent
-//! one: a parent at depth `D` and its child at depth `D-1` look exactly the same distance down the
-//! tree. `search` already records the score of every fully-completed iteration
-//! (`SearchInfo::depth_scores`), so both readings come out of the one search the position needed
-//! anyway — no second search, and no fixed depth limit either. For each adjacent pair the comparison
-//! depth is `D = min(deepest(parent), deepest(child) + 1)`, so a position that ran out of nodes
-//! early just gets compared shallower instead of being mismatched.
-//!
-//! **Every reading is averaged over the last few iterations** rather than taken from the deepest one
-//! alone — the parent across `D, D-1, ...` and the child across `D-1, D-2, ...`, weighted by
-//! `DEPTH_KERNEL`. That constant carries the measurements and is the only place to change it; what
-//! follows is why there are two different reasons for it.
-//!
-//! For the **curve** it fixes a real error. Adjacent positions get the same node budget but rarely
-//! stop at the same depth, and a search of depth `D` from one position and depth `D` from the next
-//! do not look the same distance down the tree — the parity is opposite. So the bar moves because the
-//! *search* changed rather than because the *position* did, and it moves most on exactly the plies
-//! where it should not move at all: a move the engine itself would have played is worth what the
-//! position before it was worth, and the curve stepped a mean 1.33 win points across those anyway,
-//! up to 11. Averaging mixes the parities instead of picking one, and halves it.
-//!
-//! For the **grade** it fixes nothing, because every pairing in the window is already horizon-matched
-//! — that is what `align` does. It is applied there so the badge and the bar are read off the same
-//! thing: with the curve smoothed and the grade not, the two disagree by 1.09 win points on an
-//! average non-best ply, against 0.70 with both. The grade's *accuracy* barely moves (0.21 win points
-//! better, and band flips stay a coin toss), so if this is ever reconsidered, reconsider it as a
-//! consistency choice and not an accuracy one.
-//!
-//! This engine has no quiescence search — leaf nodes are a static eval behind a hard horizon (see
-//! `alpha_beta`'s `depth == 0` arm) — so the parity effect is the dominant error term and aligning
-//! it is worth more here than it would be in an engine that resolves captures at the leaf. What it
-//! does *not* remove is search instability: the child is re-searched from scratch with a cleared TT,
-//! so its move ordering, LMR and null-move decisions differ from the same subtree inside the
-//! parent's search. `raw_cp` on the ply the engine itself chose is exactly that residual, and is
-//! reported so it can be measured rather than assumed.
-//!
-//! The case alignment handles badly is a *lopsided* pair. `D` is capped by whichever position
-//! searched shallower, so when the position before a ply reaches depth 7 and the position after it
-//! reaches depth 10, the grade is computed from a 6-deep reading of a position the sheet draws at
-//! depth 10 — and the sheet ends up showing a rising evaluation next to a Blunder badge. That gap is
-//! measurable without any extra search (`MAX_GRADE_DRIFT`), and when it opens the ply is re-measured
-//! the sibling way, which does not depend on alignment at all (`regraded` in the output marks them).
-//!
-//! How much of that gap is tolerated (`MAX_GRADE_DRIFT`) is the one number deciding how often a
-//! badge lands a grade away from what a deeper search would say, and it is set from measurement:
-//! below two win percentage points of drift the aligned grade is as good as either other method,
-//! above it the method comes apart while the sibling measurement does not. It fires on 2-19% of
-//! plies across the sample games (9.5% overall), so most of the one-search-per-ply saving survives.
-//!
-//! A ply whose *parent* the search solved is the other way alignment fails, and it fails silently.
-//! Solving stops the iteration, so the pair can come out at depth 2 — a proven win on one side and a
-//! two-ply guess on the other — and the drift test cannot object, because win scores sit where the
-//! sigmoid is flat and every difference out there reads as a couple of points. Hence `is_solved`: a
-//! pairing that straddles the mate/evaluation boundary is rejected without consulting the drift.
-//!
-//! `sharp_cp` needs no extra search under either method: multi-PV 2 already returns the best and
-//! second-best root moves with exact scores from the same search, at the same depth and for the same
-//! side to move, so the gap between them is directly comparable.
-//!
-//! `Grading::Both` computes both and reports the sibling method alongside, for calibrating one
-//! against the other.
+//! Plain differencing of a position against its child was rejected once, for swings of up to 27cp on
+//! plies the engine itself picked: the child search sees a ply deeper, so the two horizons differ.
+//! Those plies are now pinned, and on the rest the bar is read across several depths
+//! (`DEPTH_KERNEL`), which mixes the two parities rather than picking one. The step it still shows
+//! across the engine's own move — 1.1 win points on average — is the measurement's own noise, and is
+//! now the same noise in the badge and in the bar.
 //!
 //! **The other moves that were available** (`--alts`). A caller grading a ply on how *hard it was to
 //! see* eventually needs to know what else was on offer: a sacrifice is only remarkable if the quiet
@@ -226,98 +185,40 @@ pub(crate) const SOLVED_MARGIN: i32 = 200;
 /// (`datagen.rs`), i.e. equivalently `sigmoid(human_cp / 100)`.
 const EVAL_SCALE: f64 = 400.0;
 
-/// How far the aligned grade's reading of a position may sit from the deepest reading of that same
-/// position before the grade is thrown out and re-measured against a sibling (see part 3 of the
-/// grading). In win percentage points, the unit the badge bands are defined in.
-///
-/// **Measured, not reasoned.** Graded against an 8x-deeper reference run over two whole games (117
-/// gradable plies), the aligned grade is indistinguishable from the sibling and naive measurements
-/// while the drift stays under two points — all three sit around a point of error — and comes apart
-/// above it: mean error 3.5 points at two, 7.5 at three, 25 at five, against a sibling measurement
-/// that stays near two throughout. So this is where the method stops being trustworthy, and it fires
-/// on about a tenth of plies, which is what it costs in extra sibling searches.
-///
-/// It was 5.0, and being *above* the width of a whole band is what made it useless: the bands it
-/// feeds are 2 and 3 points wide (Good 1-3, Inaccurate 3-6), so a grade could land two bands from
-/// what a deeper search says and still pass.
-const MAX_GRADE_DRIFT: f64 = 2.0;
-
 /// How a position is read off its own iterative-deepening ladder: weights for the deepest completed
 /// iteration, the one below it, and so on. `&[1]` is "deepest only", which is what this module did
 /// before depth averaging.
 ///
-/// **One knob, two consumers.** The sheet's curve (`score_white`) and the aligned grade (`align`)
-/// both read through it, deliberately: smoothing one and not the other is the configuration that
-/// leaves the eval bar and the badge on different footings, which is the thing this was built to fix.
-/// Changing this constant changes both together. `smooth_ladder` is where the arithmetic lives and
-/// where the edge cases (short ladders, proven wins) are handled.
+/// **It is also what the badges read.** A ply's loss is the fall in the bar across it (see the
+/// module docs), so changing this changes the grades along with the curve, and the two cannot come
+/// apart. `smooth_ladder` is where the arithmetic lives and where the edge cases (short ladders,
+/// proven wins) are handled.
 ///
 /// **Measured, not reasoned** — 2026-08-14/15, PlayTak 858074 / 812688 / 864344 / 863024 at 200k
-/// nodes/ply against a 1.6M reference. What each window buys, on the three things that move:
+/// nodes/ply against a 1.6M reference. The phantom step on a best ply — how far the curve moves
+/// across a move the engine itself would have played, which is worth exactly what the position
+/// before it was worth, so every point of it is measurement error:
 ///
-/// | weights | phantom curve step on a best ply | bar-vs-badge gap | regrade rate |
-/// |---|---|---|---|
-/// | `[1]` (before) | 1.33 | 1.12 | 18.1% |
-/// | `[3, 2, 1]` | 0.98 | 0.70 | 20.4% |
-/// | `[1, 1, 1]` | 0.94 | — | 20.8% |
-/// | `[1, 1, 1, 1]` | 0.83 | 0.58 | 28.3% |
+/// | weights | phantom step |
+/// |---|---|
+/// | `[1]` (deepest only) | 1.33 |
+/// | `[3, 2, 1]` | 0.98 |
+/// | `[1, 1, 1]` | 0.94 |
+/// | `[1, 1, 1, 1]` | 0.83 |
 ///
-/// The regrade column is **as it was when this shipped**, with the guard reading the raw deepest
-/// score. It has since been put on this kernel's own footing, which halves it — see
-/// `distrust_aligned`. The comparison between rows still holds; the absolute numbers do not.
-///
-/// The first column is the honest one: a ply the engine itself would have played is worth exactly
-/// what the position before it was worth, so the curve should not move across it at all, and every
-/// point it does move is measurement error. It halves because adjacent positions rarely stop at the
-/// same depth — the error runs 0.80 win points when the child searched one shallower (horizons
-/// already matched), 1.57 at equal depth and 1.78 when the child searched deeper, and averaging
-/// mixes the parities instead of picking one.
+/// It falls because adjacent positions rarely stop at the same depth — the error runs 0.80 win
+/// points when the child searched one shallower (horizons already matched), 1.57 at equal depth and
+/// 1.78 when the child searched deeper — and averaging mixes the parities instead of picking one.
+/// Re-measured on eight games when grading moved onto the bar (2026-10-28): 1.40 deepest-only
+/// against 1.12 with this kernel.
 ///
 /// **Window length is what matters; the shape barely does** (a flat `[1, 1, 1]` scores 0.94 against
 /// this one's 0.98). Parity-cancelling shapes — `[2, 2, 1, 1]`, `[3, 3, 1, 1]`, whose alternating sum
 /// is zero — were tried on the theory that they would cancel the odd/even component exactly, and they
 /// are no better than flat windows of the same length. Medians instead of means were tried too, on
 /// the theory that they would reject a single outlier depth, and they are worse on every measure.
-///
-/// **What it does not buy: better badges.** Of the plies whose band changes under this kernel, 15
-/// land on the reference's band and 14 land off it. The underlying loss estimate does improve, by
-/// 0.21 win points (95% CI [0.07, 0.36], paired over 144 plies), but that is small against bands 0.5
-/// to 15 points wide, so band flips stay close to a coin toss. The case for averaging the grade is
-/// the second column — the sheet agreeing with itself — not accuracy. Longer windows buy more of it
-/// and cost regrades; going past 4 also starts costing curve accuracy against the reference.
+/// Going past 4 starts costing curve accuracy against the reference.
 const DEPTH_KERNEL: &[i64] = &[3, 2, 1];
-
-/// Which method measures how much a ply gave up. See the module docs for what each one does and why
-/// the naive parent-vs-child difference is not among them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Grading {
-    /// Search the best alternative move and compare siblings. One extra search per ply.
-    Sibling,
-    /// Compare the parent at depth `D` against the child at depth `D-1`, both read off the searches
-    /// the positions needed anyway. No extra search.
-    Aligned,
-    /// Compute both and report the sibling numbers alongside, for calibration.
-    Both,
-}
-
-impl Grading {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "sibling" => Some(Self::Sibling),
-            "aligned" => Some(Self::Aligned),
-            "both" => Some(Self::Both),
-            _ => None,
-        }
-    }
-    /// Does this mode need the extra sibling search?
-    fn needs_sibling(self) -> bool {
-        matches!(self, Self::Sibling | Self::Both)
-    }
-    /// Does this mode need the depth curve?
-    fn needs_aligned(self) -> bool {
-        matches!(self, Self::Aligned | Self::Both)
-    }
-}
 
 /// A ply written as this in the ply list is not read as PTN: the engine searches the position and
 /// plays **its own best move** instead, then grades it like any other ply (loss 0, by definition).
@@ -348,8 +249,6 @@ pub struct AnalyzeGameConfig {
     pub output: Option<String>,
     /// Suppress the per-ply stderr progress line.
     pub quiet: bool,
-    /// How to measure each ply's loss. `Aligned` is half the searches of `Sibling`.
-    pub grading: Grading,
     /// How many root moves to enumerate alongside a ply (see `Alternatives`). 0 turns the whole
     /// thing off, which is the default; the search caps it at `MAX_MULTI_PV`.
     pub alts: usize,
@@ -404,7 +303,6 @@ impl Default for AnalyzeGameConfig {
             plies: Vec::new(),
             output: None,
             quiet: false,
-            grading: Grading::Aligned,
             alts: 0,
             alts_min_decided: 0.0,
             alts_max_loss_pct: f64::INFINITY,
@@ -431,28 +329,20 @@ impl AltsIrregular {
     }
 }
 
-/// One grading method's verdict on one ply, in the mover's frame and in internal cp.
+/// A ply's grade, in the mover's frame and in internal cp. See `bar_grade`.
 #[derive(Clone, Copy, Default)]
 struct Grade {
-    /// How much the ply gave up. Clamped at 0, and pinned to 0 for the engine's own best move.
+    /// How far the bar fell across the ply. Clamped at 0, and pinned to 0 for the engine's own best
+    /// move. A diagnostic: grade on the endpoints (`loss_win_pct`), never on this.
     loss: i32,
-    /// The same comparison *before* clamping. For `Aligned` on a ply the engine itself chose this is
-    /// the method's error — it should be 0 and isn't — which is the whole reason it is reported.
-    /// (For `Sibling` on such a ply the reference is the runner-up instead, so this is just
-    /// `-sharp`, not an error term.)
-    raw: i32,
-    /// False when the method had nothing to grade against; `loss` is then a meaningless 0.
+    /// False when one of the two positions had no completed search to read; `loss` is then a
+    /// meaningless 0.
     exact: bool,
     /// Gap back to the runner-up. `None` unless the ply was the engine's best move.
     sharp: Option<i32>,
-    /// The value of the position before the ply — the deepest the search got, **not** whatever depth
-    /// the loss happened to be measured at.
-    ///
-    /// These are deliberately different numbers. The loss needs matched horizons, which can force it
-    /// down to a shallow pairing; the *position's value* has no such constraint and should always be
-    /// the best estimate available, because that is what the bar draws and what decides how settled
-    /// the game already was. Reading it at the comparison depth instead made a resolved position look
-    /// live, which let a lost position keep collecting Fatal badges.
+    /// The value of the position before the ply: its best root move's score at the deepest
+    /// iteration. It is not the grade's reference — that is the bar (`Searched::smoothed`) — but
+    /// what decides how settled the game already was (`win_prob_before`).
     ///
     /// **Not smoothed through `DEPTH_KERNEL`, unlike the sheet's bar.** It comes from `top()`, the
     /// best *root move's* score, and only the final iteration's root list survives the search — there
@@ -461,37 +351,29 @@ struct Grade {
     /// `sharp` are the two grading numbers still read at a single depth; the gap that leaves between
     /// `cp_before` and the previous ply's bar is a fraction of a win point and predates this.
     cp_before: i32,
-    /// The value this method assigned to the move actually played, on its own footing. Compared
-    /// against the deepest reading of the same position to detect a grade the search has outgrown.
-    played_value: i32,
-    /// The two ends of the comparison this grade is about, in the mover's frame and — this is the
-    /// whole point — **on one footing**, from one method's reading of both.
+    /// The two ends of the comparison this grade is about, in the mover's frame and **on one
+    /// footing**.
     ///
-    /// `cmp_played` is the move that was played, `cmp_other` the move it is measured against. Which
-    /// move that is follows `played_best`, and the two cases are mutually exclusive: a ply that was
-    /// the engine's own choice is compared against the **runner-up** and gives up nothing, and a ply
-    /// that was not is compared against the **best move** and is not sharp. So one pair of endpoints
-    /// carries both `loss` and `sharp`.
+    /// `cmp_played` is the move that was played, `cmp_other` the move it is measured against. On an
+    /// ordinary ply those are the bar after it and the bar before it. A ply that was the engine's own
+    /// choice is compared against the **runner-up** instead, both ends off the parent's root list, and
+    /// gives up nothing; one that was not is not sharp. So one pair of endpoints carries both `loss`
+    /// and `sharp`.
     ///
-    /// They exist because `loss` and `cp_before` cannot be used to recover them. `cp_before` is
-    /// deliberately the *deepest* reading of the position before the ply (see above) while `loss`
-    /// can be measured by a different search entirely — the sibling regrade re-searches from
-    /// scratch — so `cp_before - loss` is a mix of two readings and can land nowhere near the value
-    /// the ply actually reached. Consumers normalise these two into win probability and subtract
-    /// *there*; that is the only subtraction that is meaningful when one end is a proven win and the
-    /// other is an evaluation, because the sigmoid saturates instead of running off the scale.
+    /// They exist because `loss` and `cp_before` cannot be used to recover them: `cp_before` is the
+    /// best root move's deepest score while the reference is the smoothed bar, so `cp_before - loss`
+    /// mixes two readings. Consumers normalise these two into win probability and subtract *there*;
+    /// that is the only subtraction that is meaningful when one end is a proven win and the other is
+    /// an evaluation, because the sigmoid saturates instead of running off the scale.
     ///
     /// **On a `played_best` ply, `cmp_other` never sits above `cmp_played`.** It is the runner-up, so
     /// the pair runs the other way and the ply gave up nothing by definition — which is exactly what
     /// pinning `loss` to 0 says. The clamp that guarantees it is not cosmetic: each multi-PV index is
-    /// a full re-search with the earlier PVs excluded at the root, and the sibling method searches
-    /// the two moves independently, so either can hand back a runner-up that scored *above* the move
-    /// it lost to. Left alone that reads as the best move in the position having given ground, which
-    /// is how a Great move becomes an Inaccuracy.
+    /// a full re-search with the earlier PVs excluded at the root, and can hand back a runner-up that
+    /// scored *above* the move it lost to. Left alone that reads as the best move in the position
+    /// having given ground, which is how a Great move becomes an Inaccuracy.
     cmp_played: i32,
     cmp_other: i32,
-    /// `Aligned` only: the depth the comparison was made at (parent `D`, child `D-1`).
-    depth: Option<usize>,
 }
 
 impl Grade {
@@ -691,9 +573,9 @@ struct PlyAnalysis {
     /// `None` on a terminal ply — the game is over, not about to be.
     mate: Option<Mate>,
     /// Deepest fully-completed iteration of the search of the position this ply reached. `None` for
-    /// a terminal ply, which is pinned rather than searched. The grading compares against the ply
-    /// *before*, so a position that searched much shallower than its predecessor drags the whole
-    /// comparison down to its own depth — which is worth being able to see.
+    /// a terminal ply, which is pinned rather than searched. A position that searched much
+    /// shallower than its neighbours reads its bar — and so the grades either side of it — off a
+    /// shallower window, which is worth being able to see.
     ///
     /// The **top of the reading window**, not the depth of a single reading: `score_white` averages
     /// this iteration with the ones below it (`DEPTH_KERNEL`).
@@ -709,30 +591,17 @@ struct PlyAnalysis {
     /// What the best *other* move in that position would have come to, on a ply that did. `None`
     /// everywhere else, and where there was no other move to try. See `BestAlt`.
     best_alt: Option<BestAlt>,
-    /// The depth-aligned grade, when computed.
-    aligned: Option<Grade>,
-    /// The sibling-search grade, when computed.
-    sibling: Option<Grade>,
-    /// Whether this ply was the engine's own best move. The aligned method's `raw` is only an error
-    /// term on these plies, so the comparison script needs to know which they are.
+    /// The ply's grade, off the bar (see `bar_grade`).
+    grade: Grade,
+    /// Whether this ply was the engine's own best move — the one kind of ply graded against the
+    /// runner-up rather than the bar.
     played_best: bool,
-    /// The aligned grade was discarded and the ply re-measured against a sibling, because the depth
-    /// alignment landed on a reading the deeper search contradicts (see part 3 of the grading).
-    regraded: bool,
     /// The other moves available here, when this ply passed the `--alts` gates.
     alts: Option<Alternatives>,
     /// Every fully-completed iteration of the search of the position this ply reached, as
     /// `(depth, White-frame internal score)`, ascending. Empty unless `--depth-scores` asked for it,
     /// and on a terminal ply, which is pinned rather than searched. Diagnostic only.
     depth_scores: Vec<(usize, i32)>,
-}
-
-impl PlyAnalysis {
-    /// The grade the exported `loss_cp` / `sharp_cp` / `cp_before` fields come from. `Both` reports
-    /// the aligned numbers as primary and the sibling ones alongside.
-    fn primary(&self) -> Grade {
-        self.aligned.or(self.sibling).unwrap_or_default()
-    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -794,18 +663,6 @@ fn is_solved(score: i32) -> bool {
     score.abs() >= WIN_SCORE - SOLVED_MARGIN
 }
 
-/// The gap between two internal-cp scores expressed in win percentage points, which is how far apart
-/// they are in the terms the badges are graded on rather than in raw cp. The same cp gap matters far
-/// more in a balanced position than a decided one, and this is what says so.
-///
-/// **Blind out where the win scores live**, and unavoidably so: the sigmoid is flat there, so the
-/// whole span from a comfortable win to a proven one compresses into the last few percentage points.
-/// Callers using this to decide whether two readings *disagree* have to rule out a solved/unsolved
-/// pairing separately — see `is_solved`.
-fn drift_win_pct(a: i32, b: i32) -> f64 {
-    (sigmoid(a as f64 / EVAL_SCALE) - sigmoid(b as f64 / EVAL_SCALE)).abs() * 100.0
-}
-
 /// Read a position off its depth ladder as a weighted average of the iteration ending at `top` and
 /// the ones below it, per `DEPTH_KERNEL`. `None` when `top` itself never completed.
 ///
@@ -819,8 +676,7 @@ fn drift_win_pct(a: i32, b: i32) -> f64 {
 /// - **A proven win is in range.** Win scores are `WIN_SCORE - distance`, thousands of cp from any
 ///   evaluation, so averaging the two produces a number that is neither. The window stops below the
 ///   shallowest solved reading — but the reading *at* `top` is always kept, solved or not, so a
-///   position the search solved still reports its proof rather than a blend. This is the same
-///   boundary `is_solved` guards in `distrust_aligned`, for the same reason. It catches the search's
+///   position the search solved still reports its proof rather than a blend. It catches the search's
 ///   window sentinels too, which sit further out still (`is_real_score`) — those are not scores at
 ///   all, and averaging one in would drag a whole position thousands of cp.
 ///
@@ -954,10 +810,6 @@ impl Searched {
     /// The deepest fully-completed iteration.
     fn deepest(&self) -> Option<usize> {
         self.depths.last().map(|&(d, _)| d)
-    }
-    /// This position's score at a specific depth.
-    fn score_at(&self, depth: usize) -> Option<i32> {
-        self.depths.iter().find(|&&(d, _)| d == depth).map(|&(_, s)| s)
     }
     /// This position's score read across `DEPTH_KERNEL`, ending at `depth`.
     fn smoothed_at(&self, depth: usize) -> Option<i32> {
@@ -1151,79 +1003,35 @@ fn mate_of<B: TakBoard>(
     Ok((Some(Mate { winner, plies, kind }), line))
 }
 
-/// Grade a ply by comparing the parent at depth `D` against the child at depth `D-1`, which put the
-/// same horizon under both. `D` is the deepest pairing both searches actually completed, so a
-/// position that ran out of nodes early is compared shallower rather than mismatched.
+/// Grade a ply off the bar: the position before it against the position it reached, each read the
+/// way the sheet draws it (`Searched::smoothed`), in the mover's frame. See the module docs.
 ///
-/// Both ends are then read through `DEPTH_KERNEL` — the parent across `D, D-1, ...` and the child
-/// across `D-1, D-2, ...` — so the pairing is a weighted average of several aligned comparisons
-/// rather than one. Every pairing in the window is horizon-matched by construction, so this is not
-/// fixing a parity problem the way the curve's smoothing is; it is here so the badge and the eval
-/// bar are read off the same thing. See `DEPTH_KERNEL` for what that is worth and what it is not.
-///
-/// **Averaged in cp, not in win probability.** The endpoints are the contract (`Grade::cmp_played`),
-/// and callers subtract them through the sigmoid themselves, so the averaging has to happen before
-/// that or the exported numbers stop being the ends of the comparison they are documented as. The
-/// two orders differ by 0.009 win points on average and 0.09 at worst, measured over 144 plies.
-///
-/// `parent` is in the mover's frame; `child` is in the opponent's, hence the negation. Returns
-/// `None` when no valid pairing exists — the child needs a completed depth 1, so the parent needs 2.
-fn align(parent: &Searched, child: &Searched, played_best: bool) -> Option<Grade> {
-    let depth = parent.deepest()?.min(child.deepest()? + 1);
-    if depth < 2 {
-        return None;
-    }
-    // The *reference* is the parent at the matched depth; the position's reported value is its
-    // deepest reading. See `Grade::cp_before` for why those must not be the same number.
-    //
-    // The two windows shorten independently (`smooth_ladder`), which is deliberate: they are
-    // readings of two different positions and each is entitled to whatever ladder its own search
-    // built. `depth` already caps both at the shallower search, so neither can run away from the
-    // other by more than the kernel's own length.
-    let reference = parent.smoothed_at(depth)?;
-    let played_value = -child.smoothed_at(depth - 1)?;
-    let raw = reference - played_value;
-    let sharp = if played_best { parent.root_gap() } else { None };
-    // A ply the engine chose is compared against the runner-up, and both ends of *that* comparison
-    // come from the parent's own root list rather than from the aligned pairing — same search, same
-    // depth, so `top()` and the gap back from it are exactly `roots[0]` and `roots[1]`. Every other
-    // ply is compared against the best move, which is the aligned pairing itself.
-    let (cmp_played, cmp_other) = match sharp {
-        Some(gap) => (parent.top(), parent.top() - gap.max(0)),
-        None if played_best => (parent.top(), parent.top()),
-        None => (played_value, reference),
+/// `played` is what the position the ply reached is worth to the mover — the negated bar of that
+/// position, or the pinned result of a game the ply ended — and `None` when its search completed no
+/// iteration, so there is no bar to read. Either side without one leaves the ply ungraded.
+fn bar_grade(before: &Searched, played: Option<i32>, played_best: bool) -> Grade {
+    let cp_before = before.top();
+    let Some(played) = played.filter(|_| before.deepest().is_some()) else {
+        return Grade { cp_before, ..Default::default() };
     };
-    Some(Grade {
-        loss: if played_best { 0 } else { raw.max(0) },
-        raw,
+    let reference = before.smoothed();
+    let sharp = if played_best { before.root_gap() } else { None };
+    // A ply the engine chose is compared against the runner-up it beat, both ends off the parent's
+    // own root list — same search, same depth, so `top()` and the gap back from it are exactly
+    // `roots[0]` and `roots[1]`. Every other ply is compared against the bar it was played from.
+    let (cmp_played, cmp_other) = match sharp {
+        Some(gap) => (cp_before, cp_before - gap.max(0)),
+        None if played_best => (cp_before, cp_before),
+        None => (played, reference),
+    };
+    Grade {
+        loss: if played_best { 0 } else { (reference - played).max(0) },
         exact: true,
         sharp,
-        cp_before: parent.top(),
-        played_value,
+        cp_before,
         cmp_played,
         cmp_other,
-        depth: Some(depth),
-    })
-}
-
-/// What a sibling search says the move it played is worth, in the **mover's** frame — `None` when
-/// the search came back with nothing worth comparing against.
-///
-/// **Read at the search's own deepest, not through `DEPTH_KERNEL`**, and deliberately so. Both ends
-/// of a sibling comparison are full-budget searches of positions the same distance down the game, so
-/// there is no horizon to reconcile — which is the whole reason this method is the authority when the
-/// aligned pairing is distrusted. Smoothing it would make the fallback depend on the same ladder the
-/// thing it is checking depends on. The cost is that on a regraded ply the badge and the eval bar are
-/// back on different footings; that is a known gap, and the bar-vs-badge figure quoted in
-/// `DEPTH_KERNEL` was measured on the aligned path only.
-///
-/// Two ways that happens, and both would otherwise pass silently into a cp subtraction and come out
-/// looking like a real grade. A budget too small to finish even one iteration leaves `Searched::score`
-/// at the zero `search_position` falls back to, which reads as a dead-level position rather than as
-/// "no answer". And a PV that found no move at all comes back holding one of the search's window
-/// sentinels, two orders of magnitude outside the range a score can occupy.
-fn sibling_value(searched: &Searched) -> Option<i32> {
-    (searched.deepest().is_some() && is_real_score(searched.score)).then(|| -searched.score)
+    }
 }
 
 /// What a finished game is worth to `player`, in their own frame.
@@ -1237,38 +1045,6 @@ fn terminal_value(result: GameResult, player: Color) -> i32 {
         }
         GameResult::Draw => 0,
     }
-}
-
-/// Play `alt` and report what it is worth to the mover, undoing it before returning.
-///
-/// The terminal arm is not a nicety. A move that wins outright leaves a *finished* position, and
-/// searching one completes no iteration at all — so `sibling_value` refuses it, correctly, and
-/// without this arm the strongest alternative there can be, the one that simply wins, comes back as
-/// "no answer". The ply that declined it is then ungraded, which on the sheet is a move with no
-/// badge rather than the mistake it was.
-fn alternative_value<B, S>(
-    board: &mut B,
-    searcher: &mut S,
-    alt: GameMove,
-    player: Color,
-    nodes: &mut u64,
-) -> anyhow::Result<Option<i32>>
-where
-    B: TakBoard,
-    S: PositionSearch<B>,
-{
-    let rev = board.do_move(alt);
-    let value = match board.game_result() {
-        Some(result) => Ok(Some(terminal_value(result, player))),
-        None => searcher.search(board, Breadth::Grading).map(|(searched, spent)| {
-            *nodes += spent;
-            // The search scores the position from the *opponent's* view — they are to move there —
-            // so `sibling_value` negates it into the mover's.
-            sibling_value(&searched)
-        }),
-    };
-    board.reverse_move(rev);
-    value
 }
 
 /// The best move other than the one played, searched the way the played move was — the evidence
@@ -1336,74 +1112,6 @@ where
     };
     board.reverse_move(rev);
     Ok(BestAlt { display, value, solved_loss })
-}
-
-/// The comparison endpoints for a sibling measurement, as `(played, other)`.
-///
-/// The clamp is the whole reason this is a function rather than a tuple literal: on a ply the engine
-/// itself chose, `alt` is the **runner-up**, and two independently searched siblings can perfectly
-/// well come back with the runner-up ahead. That is a zero gap, not a negative one — the same clamp
-/// `loss` and `sharp` already carry, and without it the best move in the position grades as having
-/// given ground. See `Grade::cmp_played`.
-fn sibling_endpoints(played_value: i32, alt: i32, played_best: bool) -> (i32, i32) {
-    (played_value, if played_best { alt.min(played_value) } else { alt })
-}
-
-/// Should this aligned grade be thrown away and the ply re-measured against a sibling? See part 3 of
-/// the grading for what each arm is guarding against.
-///
-/// `deepest_played` is the value of the position the ply reached, read at the deepest depth its own
-/// search completed and **through `DEPTH_KERNEL`, the same smoothing `g.played_value` carries**. The
-/// aligned grade read that same position around `D-1`, so the two are readings of one position on
-/// one footing, and are entitled to agree.
-///
-/// **What the matched footing gives up.** The pairing depth is `D = min(parent_deepest,
-/// child_deepest + 1)`, so whenever the parent searched deeper than the child, `D - 1` *is* the
-/// child's deepest and the two sides are literally the same number — drift 0, and no threshold can
-/// fire. That is **28.7% of plies**, where the only arms left are the solved ones. The raw footing
-/// this replaced did fire there, but on nothing the guard claims to measure: at equal depth the gap
-/// between the two sides is the smoothing offset, i.e. how far the last three iterations wobbled.
-///
-/// **Measured, not reasoned** — 2026-08-22/23, 14 games / 1153 gradable plies at 200k nodes/ply
-/// against a 1.6M reference: the ten fixtures in `takana-dev/samples/accuracy/` plus the four games
-/// in `DEPTH_KERNEL`'s table. One `-g both --depth-scores` run per game grades every ply both ways,
-/// so any footing replays offline without a rebuild.
-///
-/// | footing | fires | searches saved | mean \|err\| vs the reference | band agreement |
-/// |---|---|---|---|---|
-/// | raw deepest (before) | 21.2% | — | 1.26 | 72.4% |
-/// | smoothed deepest (this) | 9.5% | 135, ~9.7% of wall time | 1.28 | 72.2% |
-/// | hybrid (below) | 11.6% | 111 | 1.27 | 72.3% |
-///
-/// 139 plies change which grade publishes and 53 change badge band, 30 harsher and 23 softer. The
-/// accuracy cost is a point estimate with the sign against this change and a confidence interval
-/// that spans zero: **+0.14 win points on the changed plies, 95% CI [-0.17, 0.46]**, band flips 20
-/// onto the reference's band and 23 off it, head-to-head 37 better / 45 worse / 57 tied. Everything
-/// there is inside the ~1.2-point per-ply noise floor, so this was chosen on cost and on the sheet
-/// agreeing with itself (bar-vs-badge 0.841 -> 0.799), not on accuracy.
-///
-/// **The hybrid, if the volatility signal is ever wanted back.** Pass the raw deepest reading where
-/// `D - 1 == child_deepest` and the smoothed one everywhere else — a condition at the call site,
-/// nothing here changes. It keeps 82% of the saving and today's behaviour on the plies where the
-/// guard still has teeth: on that blind subset the raw footing's firings have mean
-/// |aligned - sibling| 2.47 against 0.63 for the plies it passes, and the plies this change flips
-/// there do get worse (mean |err| 2.82 -> 3.28, band agreement 62.5% -> 54.2%, n=24, CI
-/// [-0.57, 1.59]). It also gives up almost all of the bar-vs-badge gain, which comes from those same
-/// volatile plies. The informative subset is a wash either way (1.55 -> 1.62).
-///
-/// If the firing rate ever needs to move again, change the call site rather than `MAX_GRADE_DRIFT`,
-/// and know which of the two you are buying.
-fn distrust_aligned(g: &Grade, deepest_played: i32) -> bool {
-    // Nothing to trust: the method had no usable pair at all.
-    if !g.exact {
-        return true;
-    }
-    // The parent's half of the comparison, recovered: `raw` is what the two sides differed by, so
-    // adding the played side back gives the reference it was measured against.
-    let reference = g.raw + g.played_value;
-    is_solved(reference) != is_solved(g.played_value)
-        || is_solved(g.played_value) != is_solved(deepest_played)
-        || drift_win_pct(g.played_value, deepest_played) >= MAX_GRADE_DRIFT
 }
 
 /// Convert a side-to-move score to the fixed White-perspective frame the sheet's bars use.
@@ -1626,20 +1334,9 @@ where
             t
         };
 
-        // ---- Grading, part 1: value the alternative, from here ----
-        //
-        // Only the sibling method needs this, and only it pays for it: one extra search per ply.
-        // Which sibling depends on what was played. If the ply *was* the best move, the alternative
-        // is the second-best; if it wasn't, the alternative is the best move.
-        //
-        // The position's own value before the ply, in the mover's frame — the "how won/lost was this
-        // already?" number.
-        let before_top = before.top();
+        // Was this the engine's own choice? Such a ply gives up nothing by definition, and is
+        // compared against the runner-up rather than against the bar (see `bar_grade`).
         let played_best = before.best_move() == Some(mv);
-        let alt_value = match cfg.grading.needs_sibling().then(|| before.best_other_move(mv)) {
-            Some(Some(alt)) => alternative_value(&mut board, searcher, alt, player, &mut nodes)?,
-            _ => None,
-        };
 
         // Display PTN, computed before the move while the source stack is still intact.
         let display = short_ptn(&board, mv);
@@ -1660,9 +1357,8 @@ where
             ps.movements += 1;
         }
 
-        // Play it and measure it. `rev_played` is kept so the grading can step back to this
-        // position if it needs the sibling comparison after all (see part 3), and so the
-        // alternatives below can be played from it.
+        // Play it and measure it. `rev_played` is kept so the alternatives below, and the best
+        // alternative on a ply that lost the game, can be played from the position before it.
         let (facts, rev_played) = play_and_measure(
             &mut board,
             mv,
@@ -1761,7 +1457,7 @@ where
         // The line the search was looking at, read from the position this ply *reached* — so it is
         // the engine's answer to "and then what?", with its recommended reply first — and, on a
         // proven win, carried on to the end of the game. Taken here, while the board still sits on
-        // that position and before the regrade below borrows it back.
+        // that position and before the alternatives below step back off it.
         let pv = pv_ptn(&mut board, &line);
 
         // ...and the other line that search looked at. Same position, same search, same depth, so
@@ -1792,166 +1488,16 @@ where
             Vec::new()
         };
 
-        // ---- Grading, part 2: measure what the ply gave up ----
+        // ---- Grading: how far the bar fell ----
         //
-        // The played ply's own value, in the mover's frame. A ply that ended the game is pinned
-        // rather than searched.
+        // What the position the ply reached is worth to the mover, read as the bar reads it — the
+        // pinned result for a ply that ended the game, and nothing at all for a search that finished
+        // no iteration. See `bar_grade`.
         let played_value = match terminal {
-            Some(result) => terminal_value(result, player),
-            None => -after.score,
+            Some(result) => Some(terminal_value(result, player)),
+            None => after.deepest().map(|_| -after.smoothed()),
         };
-
-        // Sharpness only means anything for a ply that *was* the best move: otherwise a better move
-        // existed by definition, and no gap to the runner-up can make it the only good move.
-        // `cp_before` still has to survive a ply the method could not grade — the bot normalises the
-        // loss against it, and the sheet's win-probability bar reads it.
-        let sibling = cfg.grading.needs_sibling().then(|| match alt_value {
-            Some(alt) => {
-                let raw = alt - played_value;
-                let (cmp_played, cmp_other) = sibling_endpoints(played_value, alt, played_best);
-                Grade {
-                    // Search is not perfectly consistent between siblings, so a ply can come out
-                    // marginally "better than best"; that is a zero loss, not a negative one.
-                    loss: if played_best { 0 } else { raw.max(0) },
-                    raw,
-                    exact: true,
-                    sharp: if played_best { Some(-raw) } else { None },
-                    cp_before: before_top,
-                    played_value,
-                    // Both ends come from sibling searches of the two moves — one footing by
-                    // construction, whichever move `alt` turned out to be.
-                    cmp_played,
-                    cmp_other,
-                    depth: None,
-                }
-            }
-            None => Grade {
-                cp_before: before_top,
-                played_value,
-                cmp_played: played_value,
-                cmp_other: played_value,
-                ..Default::default()
-            },
-        });
-
-        // A ply that ended the game has no child search to align against, so the pinned terminal
-        // value stands in for it — that comparison needs no horizon matching to begin with.
-        let aligned = cfg.grading.needs_aligned().then(|| {
-            if terminal.is_some() {
-                let raw = before_top - played_value;
-                let sharp = if played_best { before.root_gap() } else { None };
-                // A ply that ended the game has no search of its own to be read at any depth: its
-                // value is the pinned result. So the two ends are the position before it and the
-                // outcome it produced, and they are only comparable once normalised — in cp, a
-                // game-losing ply reads as a loss of `before_top + WIN_SCORE`, which is not a
-                // quantity. In win probability it reads as "gave up whatever was left", which is.
-                let (cmp_played, cmp_other) = match sharp {
-                    Some(gap) => (before_top, before_top - gap.max(0)),
-                    None if played_best => (before_top, before_top),
-                    None => (played_value, before_top),
-                };
-                Grade {
-                    loss: if played_best { 0 } else { raw.max(0) },
-                    raw,
-                    exact: true,
-                    sharp,
-                    cp_before: before_top,
-                    played_value,
-                    cmp_played,
-                    cmp_other,
-                    depth: None,
-                }
-            } else {
-                align(&before, &after, played_best).unwrap_or(Grade {
-                    cp_before: before_top,
-                    played_value,
-                    cmp_played: played_value,
-                    cmp_other: played_value,
-                    ..Default::default()
-                })
-            }
-        });
-
-        // ---- Grading, part 3: distrust an aligned grade the deeper search contradicts ----
-        //
-        // The aligned comparison reads this position at `D-1`, but the sheet's bar draws it at the
-        // deepest depth the search reached. Those normally agree closely. When they don't — because
-        // the *previous* position searched shallower than this one, dragging `D` down with it — the
-        // grade is computed from a reading the engine itself has since revised, and the sheet ends
-        // up showing a rising evaluation next to a Blunder badge.
-        //
-        // The same applies when there is no aligned pair to be had at all. A position the search
-        // *solves* stops iterating the moment it proves the win, so it can finish only depth 1 —
-        // and a pair needs the parent at 2 or more. Those plies were coming out ungraded, which on
-        // the sheet is simply a move with no badge on it.
-        //
-        // A solved position is the awkward case even when it *does* leave a usable pair, because it
-        // leaves a shallow one: stopping at depth 2 or 3 puts a proven win on one side of the
-        // comparison and a two-ply guess on the other. Subtracting those measures nothing, and the
-        // drift test cannot see it — win scores sit where the sigmoid is flat, so a mate against a
-        // merely winning evaluation reads as a few points and passes. Hence the explicit scale
-        // check: a pairing that straddles the solved/evaluation boundary is rejected on sight,
-        // whatever the drift says.
-        //
-        // The sibling comparison does not depend on depth alignment at all, which makes it exactly
-        // the right authority when alignment is the thing that failed. It costs the extra search
-        // this method exists to avoid, and at the drift threshold this is tuned to it fires on
-        // 2-19% of plies across the sample games, 9.5% overall — the price of a grade that survives
-        // comparison with a deeper search.
-        //
-        // What it does *not* do is put the two sides on one scale. Given its own full budget on one
-        // position, the re-search can prove a win the parent's multi-PV search never came close to
-        // seeing, and then the sibling is a mate score while the played move is an ordinary
-        // evaluation. That is a real finding — the ply missed a forced win — but it is only a
-        // measurable one in win probability, which is why the grade carries its endpoints (see
-        // `Grade::cmp_played`) rather than leaving a consumer to rebuild them out of cp.
-        let mut sibling = sibling;
-        let mut aligned = aligned;
-        let mut regraded = false;
-        if cfg.grading == Grading::Aligned && terminal.is_none() {
-            // The position's own deepest reading, on the pairing's footing — smoothed through
-            // `DEPTH_KERNEL` like everything else the grade and the bar are made of. `played_value`
-            // above is the raw search score, which is the right number for the sibling comparison
-            // and the wrong one to hold a smoothed reading against; see `distrust_aligned`.
-            let deepest_played = -after.smoothed();
-            let distrust = aligned.map_or(false, |g| distrust_aligned(&g, deepest_played));
-            if distrust {
-                if let Some(alt) = before.best_other_move(mv) {
-                    board.reverse_move(rev_played);
-                    let value = alternative_value(&mut board, searcher, alt, player, &mut nodes)?;
-                    board.do_move(mv);
-
-                    // A sibling search that came back with nothing leaves the distrusted aligned
-                    // grade in place rather than replacing it with a comparison against a
-                    // placeholder: a grade the deeper search argues with still beats no grade.
-                    if let Some(alt_value) = value {
-                        let raw = alt_value - played_value;
-                        let (cmp_played, cmp_other) =
-                            sibling_endpoints(played_value, alt_value, played_best);
-                        sibling = Some(Grade {
-                            loss: if played_best { 0 } else { raw.max(0) },
-                            raw,
-                            exact: true,
-                            sharp: if played_best { Some(-raw) } else { None },
-                            cp_before: before_top,
-                            played_value,
-                            // The pair this regrade exists to produce: two children of one parent,
-                            // each given the full budget, so they are on one footing however far
-                            // apart they land. This is where a re-search can prove a win the
-                            // parent's own multi-PV search never saw — `cmp_other` is then a mate
-                            // score and `cmp_played` an evaluation, and subtracting them as cp is
-                            // exactly the thing the endpoints exist to stop a consumer doing.
-                            cmp_played,
-                            cmp_other,
-                            depth: None,
-                        });
-                        // `primary()` prefers the aligned grade, so the discredited one has to go.
-                        aligned = None;
-                        regraded = true;
-                    }
-                }
-            }
-        }
+        let grade = bar_grade(&before, played_value, played_best);
 
         // ---- The other moves that were available ----
         //
@@ -1959,7 +1505,6 @@ where
         // sits on one footing (see `Alternatives`). It is a second search of a position already
         // searched once, which is why it runs only on the plies the caller's gates admit — and why
         // those gates are read here rather than left to the caller to apply afterwards.
-        let grade = aligned.or(sibling).unwrap_or_default();
         let win_prob_before = sigmoid(grade.cp_before as f64 / EVAL_SCALE);
         // Normalised off the grade's own endpoints, not off `cp_before - loss`: those two numbers
         // can come from different searches, so reconstructing the played value from them is what
@@ -2085,10 +1630,8 @@ where
             win_prob_before,
             solved_loss,
             best_alt,
-            aligned,
-            sibling,
+            grade,
             played_best,
-            regraded,
             alts,
             depth_scores,
         });
@@ -2195,7 +1738,7 @@ fn alts_json(a: &Alternatives) -> String {
     )
 }
 
-/// One grading method's numbers, in human cp. `raw_cp` is the unclamped comparison — see `Grade`.
+/// A proof as the JSON reports it — see `Mate`.
 fn mate_json(m: Option<&Mate>) -> String {
     m.map(|m| {
         format!(
@@ -2213,25 +1756,6 @@ fn mate_json(m: Option<&Mate>) -> String {
         )
     })
     .unwrap_or_else(|| "null".to_string())
-}
-
-fn grade_json(g: &Grade) -> String {
-    format!(
-        "{{\"loss_cp\": {:.2}, \"raw_cp\": {:.2}, \"exact\": {}, \"sharp_cp\": {}, \
-         \"cp_before\": {:.2}, \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \"depth\": {}}}",
-        g.loss as f64 / 4.0,
-        g.raw as f64 / 4.0,
-        g.exact,
-        g.sharp
-            .map(|s| format!("{:.2}", s as f64 / 4.0))
-            .unwrap_or_else(|| "null".to_string()),
-        g.cp_before as f64 / 4.0,
-        g.cmp_played as f64 / 4.0,
-        g.cmp_other as f64 / 4.0,
-        g.depth
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-    )
 }
 
 fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
@@ -2268,7 +1792,7 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
         } else {
             format!("{:.2}", p.score_white as f64 / 4.0)
         };
-        let g = p.primary();
+        let g = &p.grade;
         rows.push(format!(
             "    {{\"index\": {}, \"move_number\": {}, \"player\": \"{}\", \"ptn\": \"{}\", \
              \"display\": \"{}\", \"cp_white\": {}, \"win_prob_white\": {:.6}, \"call\": {}, \
@@ -2281,8 +1805,7 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
              \"cmp_played_cp\": {:.2}, \"cmp_other_cp\": {:.2}, \
              \"win_prob_before\": {:.6}, \
              \"solved_loss\": {}, \"best_alt\": {}, \
-             \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}, \
-             \"regraded\": {}{}{}{}{}}}",
+             \"played_best\": {}, \"search_depth\": {}, \"search_nodes\": {}{}{}}}",
             p.index,
             p.move_number,
             match p.player {
@@ -2350,15 +1873,6 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
             p.search_nodes
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "null".to_string()),
-            p.regraded,
-            // Per-method detail, for calibrating one against the other. The flat fields above are
-            // the contract; these are diagnostics and are only present for a method that ran.
-            p.aligned
-                .map(|g| format!(", \"aligned\": {}", grade_json(&g)))
-                .unwrap_or_default(),
-            p.sibling
-                .map(|g| format!(", \"sibling\": {}", grade_json(&g)))
-                .unwrap_or_default(),
             // Present only on the plies `--alts` was asked to spend a search on.
             p.alts
                 .as_ref()
@@ -2538,79 +2052,48 @@ mod tests {
         assert_eq!(mate(&mut board, -(WIN_SCORE - 4), &[]).unwrap().winner, Color::Black);
     }
 
-    /// An aligned grade with the two readings a `distrust_aligned` decision turns on: what the
-    /// parent was worth at the comparison depth, and what the played move was worth one below it.
-    fn graded(reference: i32, played_value: i32) -> Grade {
-        Grade {
-            loss: (reference - played_value).max(0),
-            raw: reference - played_value,
-            exact: true,
-            sharp: None,
-            cp_before: reference,
-            played_value,
-            cmp_played: played_value,
-            cmp_other: reference,
-            depth: Some(8),
+    /// A searched position worth `score` to the side to move, its root list best first.
+    fn searched(score: i32, roots: &[i32]) -> Searched {
+        let mv = GameMove::try_from_ptn("a1", &Board6::start_position()).unwrap();
+        Searched {
+            score,
+            roots: roots.iter().map(|&s| (mv, s)).collect(),
+            lines: Vec::new(),
+            depths: vec![(9, score)],
+            pv: Vec::new(),
         }
     }
 
     #[test]
-    fn agreeing_readings_are_trusted() {
-        // The aligned reading of the position the ply reached and the deepest reading of that same
-        // position are a couple of flats apart: ordinary search wobble, and the grade stands.
-        let g = graded(40, 10);
-        assert!(!distrust_aligned(&g, 14));
+    fn a_ply_gives_up_exactly_what_the_bar_falls() {
+        // The mover's position read 200 before the ply and 80 after it: the endpoints are those two
+        // bars, so the badge and the bar cannot tell different stories.
+        let g = bar_grade(&searched(200, &[200, 150]), Some(80), false);
+        assert_eq!((g.cmp_other, g.cmp_played, g.loss), (200, 80, 120));
+        assert!(g.exact && g.sharp.is_none());
     }
 
     #[test]
-    fn a_revised_reading_is_distrusted() {
-        // Same pair, but the position's own deeper search has since moved it far enough to change
-        // the grade by a band or more.
-        let g = graded(40, 10);
-        assert!(distrust_aligned(&g, 120));
+    fn a_ply_whose_bar_rose_gave_up_nothing() {
+        let g = bar_grade(&searched(200, &[200, 150]), Some(260), false);
+        assert_eq!(g.loss, 0);
+        assert_eq!(g.loss_win_pct(), Some(0.0));
     }
 
     #[test]
-    fn a_grade_with_no_pair_is_distrusted() {
-        let g = Grade { cp_before: 40, played_value: 10, ..Default::default() };
-        assert!(distrust_aligned(&g, 10));
-    }
-
-    #[test]
-    fn a_mate_against_an_evaluation_is_distrusted() {
-        // The position before the ply is a proven win; the ply's own reading is an ordinary
-        // evaluation, and the deeper search agrees with it. Something really was given up here, but
-        // subtracting a mate score from an evaluation cannot say how much, so the ply goes to a
-        // sibling search rather than standing. The drift test cannot reach this on its own: both
-        // readings of the position the ply reached agree, so there is no drift to find.
-        let g = graded(WIN_SCORE - 20, 3200);
-        assert!(drift_win_pct(g.played_value, 3200) < MAX_GRADE_DRIFT);
-        assert!(distrust_aligned(&g, 3200));
-    }
-
-    #[test]
-    fn a_mate_the_deeper_search_confirms_is_distrusted() {
-        // The other way the pairing straddles the boundary: the aligned reading of the position the
-        // ply reached is an ordinary evaluation, but its own deeper search has since proved the win.
-        // Nothing was given up at all, and the sigmoid is flat enough out there to hide the gap.
-        let mate = WIN_SCORE - 20;
-        let g = graded(mate, 1400);
-        assert!(distrust_aligned(&g, mate));
-    }
-
-    #[test]
-    fn two_mates_are_not_distrusted_for_being_mates() {
-        // Both sides proven wins, both readings agreeing: nothing was given up and the check must
-        // not invent a loss out of the mate distances.
-        let g = graded(WIN_SCORE - 12, WIN_SCORE - 20);
-        assert!(!distrust_aligned(&g, WIN_SCORE - 18));
+    fn a_position_with_no_bar_leaves_the_ply_ungraded() {
+        // No completed iteration after the ply, or none before it: nothing to read, so no grade —
+        // rather than a comparison against the zero an empty search falls back to.
+        let g = bar_grade(&searched(200, &[200]), None, false);
+        assert_eq!(g.loss_win_pct(), None);
+        let g = bar_grade(&Searched::terminal(0), Some(80), false);
+        assert_eq!(g.loss_win_pct(), None);
     }
 
     #[test]
     fn a_missed_forced_win_costs_what_the_position_was_still_worth() {
         // PlayTak 812697 ply 93, which is where this pair of fields came from. White played a move
-        // worth +405 human cp — 98.3%, and the bar goes *up* — when a sibling re-search proved a
-        // forced win was available. Missing it is real, but it cost the 1.7 points between 98.3%
+        // worth +405 human cp — 98.3% — when a re-search proved a forced win was available. Missing it is real, but it cost the 1.7 points between 98.3%
         // and certainty, and nothing like the 88.9 the cp difference used to be normalised into.
         let g = Grade {
             cmp_other: WIN_SCORE - 8, // the alternative, proven
@@ -2621,12 +2104,6 @@ mod tests {
         };
         let lost = g.loss_win_pct().expect("an exact grade has a loss");
         assert!(lost < 2.0, "a 98.3% position should not read as a blunder, got {lost}");
-
-        // The reconstruction this replaced, kept as the thing not to go back to: `cp_before` comes
-        // from the parent's search and `cmp_other` from a sibling re-search that outran it, so the
-        // implied played value lands 7500cp below where the ply actually was.
-        let loss_cp = g.cmp_other - g.cmp_played;
-        assert!(drift_win_pct(g.cp_before, g.cp_before - loss_cp) > 80.0);
     }
 
     #[test]
@@ -2642,14 +2119,19 @@ mod tests {
         // PlayTak 812697 ply 48. Multi-PV re-searches each index from scratch, so the runner-up came
         // back *above* the move it lost to. That is a zero gap; left unclamped it reads as the best
         // move in the position having given ground, and the ply grades Inaccurate.
-        let played_best = true;
-        let (cmp_played, cmp_other) = sibling_endpoints(-159, -93, played_best);
-        let g = Grade { cmp_played, cmp_other, exact: true, ..Default::default() };
+        let g = bar_grade(&searched(-159, &[-159, -93]), Some(-170), true);
+        assert_eq!(g.loss, 0);
         assert_eq!(g.loss_win_pct(), Some(0.0));
+        // ...and its endpoints are the parent's own root list, not the bar: the best move is
+        // measured against the move it beat.
+        assert_eq!((g.cmp_played, g.cmp_other), (-159, -159));
+    }
 
-        // ...and a ply that was *not* the best move keeps the alternative exactly as searched, since
-        // there the alternative being ahead is the whole point.
-        assert_eq!(sibling_endpoints(-159, -93, false), (-159, -93));
+    #[test]
+    fn the_best_move_is_measured_against_the_runner_up() {
+        let g = bar_grade(&searched(300, &[300, 120]), Some(250), true);
+        assert_eq!((g.loss, g.sharp), (0, Some(180)));
+        assert_eq!((g.cmp_played, g.cmp_other), (300, 120));
     }
 
     #[test]
@@ -2672,8 +2154,7 @@ mod tests {
         // 3:2:1 over 220 / 40 / 100 = (660 + 80 + 100) / 6 = 140.
         let ladder = [(9, 100), (10, 40), (11, 220)];
         assert_eq!(smooth_ladder(&ladder, 11, &[3, 2, 1]), Some(140));
-        // ...and the window follows `top` down the ladder, which is what pairs the two sides of a
-        // grade: the child is read one shallower than the parent.
+        // ...and the window follows `top` down the ladder when asked for a shallower reading.
         assert_eq!(smooth_ladder(&ladder, 10, &[3, 2, 1]), Some((40 * 3 + 100 * 2) / 5));
     }
 
@@ -2719,32 +2200,4 @@ mod tests {
         assert_eq!(smooth_ladder(&[(1, -1), (2, -2)], 2, &[1, 1]), Some(-2)); // -1.5 -> -2
     }
 
-    #[test]
-    fn a_sibling_search_that_finished_nothing_is_rejected() {
-        // No completed iteration: `Searched::score` is the zero the search falls back to, which
-        // would otherwise read as a dead-level position rather than as "no answer".
-        assert_eq!(sibling_value(&Searched::terminal(0)), None);
-    }
-
-    #[test]
-    fn a_sibling_search_holding_a_window_bound_is_rejected() {
-        let sentinel = Searched {
-            score: 250_000,
-            roots: Vec::new(),
-            lines: Vec::new(),
-            depths: vec![(1, 250_000)],
-            pv: Vec::new(),
-        };
-        assert_eq!(sibling_value(&sentinel), None);
-
-        // ...and an ordinary one comes back negated into the mover's frame.
-        let ok = Searched {
-            score: -1620,
-            roots: Vec::new(),
-            lines: Vec::new(),
-            depths: vec![(9, -1620)],
-            pv: Vec::new(),
-        };
-        assert_eq!(sibling_value(&ok), Some(1620));
-    }
 }
