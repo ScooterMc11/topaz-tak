@@ -55,6 +55,19 @@
 //! JSON — is the same code whichever engine answered, so another engine's sheet is graded by exactly
 //! the rules a topaz sheet is. The JSON names who searched (`engine`).
 //!
+//! **Searching in reverse.** `--reverse` searches the game's positions last to first, up front, on
+//! one table that is kept from each position to the next, so every position is read with what the
+//! engine already learned about the game's future. The grading loop then runs forward exactly as it
+//! always does, reading each position's search off that pass rather than running it. Only the
+//! grading searches are in it: the alternatives, `best_alt` and the searches that finish a proven
+//! win's line all come after the pass and go back to a cleared table, so nothing they write can move
+//! a bar. The sheet is still a pure function of the game — one thread, one fixed order — but it is no
+//! longer a function of each position alone, which is what `--tps --plies` relies on, so a
+//! single-position run no longer reproduces a reverse sheet's ply. Every ply has to be named: a
+//! `BEST_PLY` can't be played before the search that chooses it. Needs an engine that keeps its
+//! table between positions (`PositionSearch::keep_table`); only the TEI client does, since topaz's
+//! own table neither ages its entries by search nor stores mate scores relative to the node.
+//!
 //! **The opening.** `--opening swap|dbs` says what White's first move is. Without it the board
 //! falls back to the original rule, which tied the opening to komi — double black stack exactly at
 //! komi 0 — and was wrong for a double-black-stack game played with komi and for a swap game played
@@ -291,6 +304,8 @@ pub struct AnalyzeGameConfig {
     /// TEI (`crate::analyze_tei`). Nothing else changes with it: the board facts, the grading and
     /// the JSON are this module's whichever engine answers.
     pub engine: Option<TeiEngineConfig>,
+    /// Search every position last to first on one kept table before grading (see the module docs).
+    pub reverse: bool,
 }
 
 impl Default for AnalyzeGameConfig {
@@ -310,6 +325,7 @@ impl Default for AnalyzeGameConfig {
             depth_scores: false,
             double_black_stack: None,
             engine: None,
+            reverse: false,
         }
     }
 }
@@ -859,6 +875,11 @@ pub(crate) trait PositionSearch<B: TakBoard> {
     /// Search the position on `board`, side to move's frame, leaving the board as it was found.
     /// Returns the search and the nodes it spent.
     fn search(&mut self, board: &mut B, breadth: Breadth) -> anyhow::Result<(Searched, u64)>;
+    /// Keep the table from one search to the next (`true`), or go back to clearing it before every
+    /// position (`false`). Either way the table starts out empty. Only `--reverse` asks.
+    fn keep_table(&mut self, _keep: bool) -> anyhow::Result<()> {
+        anyhow::bail!("this engine can't keep its table between positions, which --reverse needs")
+    }
 }
 
 /// topaz's own search: one net, one transposition table, cleared before every position.
@@ -1245,6 +1266,49 @@ fn play_and_measure<B: TakBoard>(
     (facts, rev)
 }
 
+/// `--reverse`'s pass: every position the game reaches, searched last to first on one kept table.
+/// Indexed like the grading loop's positions — 0 is the starting position, `k` the one ply `k`
+/// reached — and `None` for a game-ending position, which is pinned rather than searched.
+fn reverse_pass<B, S>(
+    board: &B,
+    cfg: &AnalyzeGameConfig,
+    searcher: &mut S,
+) -> anyhow::Result<Vec<Option<(Searched, u64)>>>
+where
+    B: TakBoard,
+    S: PositionSearch<B>,
+{
+    let mut board = board.clone();
+    let mut played = Vec::with_capacity(cfg.plies.len());
+    let mut ended = false;
+    for (i, ptn) in cfg.plies.iter().enumerate() {
+        if ptn.eq_ignore_ascii_case(BEST_PLY) {
+            anyhow::bail!("--reverse needs every ply named, and ply {} is '{}'", i + 1, BEST_PLY);
+        }
+        let mv = GameMove::try_from_ptn(ptn, &board)
+            .filter(|&mv| board.legal_move(mv))
+            .ok_or_else(|| anyhow::anyhow!("ply {} is not a legal move here: {}", i + 1, ptn))?;
+        played.push(board.do_move(mv));
+        if board.game_result().is_some() {
+            ended = true;
+            break;
+        }
+    }
+    let n = played.len();
+    let mut out: Vec<Option<(Searched, u64)>> = (0..=n).map(|_| None).collect();
+    searcher.keep_table(true)?;
+    for k in (0..=n).rev() {
+        if !(ended && k == n) {
+            out[k] = Some(searcher.search(&mut board, Breadth::Grading)?);
+        }
+        if k > 0 {
+            board.reverse_move(played.pop().expect("one move per position past the first"));
+        }
+    }
+    searcher.keep_table(false)?;
+    Ok(out)
+}
+
 fn analyze_board<B, S>(
     mut board: B,
     cfg: &AnalyzeGameConfig,
@@ -1286,8 +1350,18 @@ where
     // it. So the loop carries the previous position's search forward — only the starting position
     // needs an extra one.
     // Every search reports its own node count, not a lifetime total, so each is added here.
+    // Under `--reverse` those searches have all been run already, last to first, and are read off
+    // `warm` instead.
+    let mut warm = if cfg.reverse {
+        reverse_pass(&board, cfg, searcher)?
+    } else {
+        Vec::new()
+    };
     let mut before = {
-        let (s, spent) = searcher.search(&mut board, Breadth::Grading)?;
+        let (s, spent) = match warm.get_mut(0).and_then(Option::take) {
+            Some(hit) => hit,
+            None => searcher.search(&mut board, Breadth::Grading)?,
+        };
         nodes += spent;
         s
     };
@@ -1416,7 +1490,10 @@ where
             }
             Some(GameResult::Draw) => Searched::terminal(0),
             None => {
-                let (s, spent) = searcher.search(&mut board, Breadth::Grading)?;
+                let (s, spent) = match warm.get_mut(i + 1).and_then(Option::take) {
+                    Some(hit) => hit,
+                    None => searcher.search(&mut board, Breadth::Grading)?,
+                };
                 search_nodes = Some(spent);
                 nodes += spent;
                 s
@@ -1770,12 +1847,13 @@ fn to_json(cfg: &AnalyzeGameConfig, a: &Analysis, engine_id: &str) -> String {
     ));
     // Who searched, by the name the caller gave it (topaz when nobody else did), and how it
     // identified itself: the TEI `id name` line, version included, which is the nearest thing to a
-    // build that the protocol carries.
+    // build that the protocol carries. `reverse` says the positions were searched last to first.
     let engine_name = cfg.engine.as_ref().map_or("topaz", |e| e.name.as_str());
     s.push_str(&format!(
-        "  \"engine\": {{\"name\": \"{}\", \"id\": \"{}\"}},\n",
+        "  \"engine\": {{\"name\": \"{}\", \"id\": \"{}\", \"reverse\": {}}},\n",
         json_escape(engine_name),
-        json_escape(engine_id)
+        json_escape(engine_id),
+        cfg.reverse
     ));
     s.push_str(&format!(
         "  \"result\": {},\n",
@@ -1959,6 +2037,9 @@ fn analyze_tei<B: TakBoard>(
 pub fn run(cfg: AnalyzeGameConfig) -> anyhow::Result<()> {
     if cfg.plies.is_empty() {
         anyhow::bail!("no plies given");
+    }
+    if cfg.reverse && cfg.engine.is_none() {
+        anyhow::bail!("--reverse needs --engine-cmd: topaz's own table can't be kept between positions");
     }
     let (analysis, engine_id) = match &cfg.engine {
         None => {

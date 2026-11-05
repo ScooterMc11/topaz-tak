@@ -22,6 +22,13 @@
 //! `teinewgame size 6 halfkomi 4`, and Syntaks reads the word `size` as an invalid board size and
 //! skips the reset — silently, which would let one position's table leak into the next.
 //!
+//! **Under `--reverse` the table is kept** (`keep_table`): `teinewgame` goes out once, on the way
+//! in, and not again until the pass is over. That is safe with Syntaks because its table already
+//! does what topaz's would need changing to do — entries are aged by search, so the newest
+//! position's survive, and mate scores are stored relative to the node, so a proof found from one
+//! root reads correctly from the next. The table is also enlarged for the pass (`KEPT_HASH_MIB`): it
+//! has to hold what a whole game's searches learned, not one position's.
+//!
 //! **Positions go in as TPS, never as a move list.** Every move-spelling question then disappears
 //! except for the moves that come *back*, and those are parsed against topaz's own board (crush flags
 //! inferred, legality checked) the same way a ply from a PTN is.
@@ -47,6 +54,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+/// The table, in MiB, while it is cleared before every position: one position's worth.
+const CLEARED_HASH_MIB: usize = 16;
+/// ...and while `--reverse` keeps it across the game: 2^25 of Syntaks's 8-byte entries, against a
+/// Standard game's ~40M nodes.
+const KEPT_HASH_MIB: usize = 256;
 
 /// Which engine to run, and how.
 #[derive(Clone, Debug)]
@@ -78,6 +91,8 @@ pub struct TeiSearch {
     /// The `MultiPV` the engine currently has, so it is only re-sent when it changes.
     multi_pv: usize,
     line: String,
+    /// `teinewgame` is held back between searches (`keep_table`).
+    keep_table: bool,
 }
 
 impl TeiSearch {
@@ -110,6 +125,7 @@ impl TeiSearch {
             nodes,
             multi_pv: 1,
             line: String::new(),
+            keep_table: false,
         };
 
         tei.send("tei")?;
@@ -131,7 +147,8 @@ impl TeiSearch {
         // One thread: a multi-threaded search is not deterministic, and the sheet has to be.
         // A small table: it is cleared before every position, so its size is only a cost.
         let mut settings: Vec<(String, String)> = Vec::new();
-        for (name, value) in [("Threads", "1"), ("Hash", "16"), ("MateScores", "true")] {
+        let hash = CLEARED_HASH_MIB.to_string();
+        for (name, value) in [("Threads", "1"), ("Hash", hash.as_str()), ("MateScores", "true")] {
             if has(name) {
                 settings.push((name.to_string(), value.to_string()));
             }
@@ -419,7 +436,9 @@ impl<B: TakBoard> PositionSearch<B> for TeiSearch {
             self.send(&format!("setoption name MultiPV value {multi_pv}"))?;
             self.multi_pv = multi_pv;
         }
-        self.send(&format!("teinewgame {}", self.size))?;
+        if !self.keep_table {
+            self.send(&format!("teinewgame {}", self.size))?;
+        }
         // topaz's `Debug` for a board is its TPS: `x,x,…/…  <side> <move>`.
         self.send(&format!("position tps {:?}", board))?;
         self.send("isready")?;
@@ -437,6 +456,16 @@ impl<B: TakBoard> PositionSearch<B> for TeiSearch {
             }
         }
         Ok(fold_search(board, &infos))
+    }
+
+    fn keep_table(&mut self, keep: bool) -> Result<()> {
+        let hash = if keep { KEPT_HASH_MIB } else { CLEARED_HASH_MIB };
+        self.send(&format!("setoption name Hash value {hash}"))?;
+        self.send(&format!("teinewgame {}", self.size))?;
+        self.send("isready")?;
+        self.wait_for("readyok")?;
+        self.keep_table = keep;
+        Ok(())
     }
 }
 

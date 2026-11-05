@@ -305,6 +305,11 @@ pub fn main() {
                 "A setoption for the --engine-cmd engine, e.g. HumanWDL=true (repeatable)",
                 "NAME=VALUE",
             );
+            opts.optflag(
+                "",
+                "reverse",
+                "Search the positions last to first on one kept table (needs --engine-cmd)",
+            );
             opts.optflag("q", "quiet", "Suppress per-ply progress on stderr");
             opts.optflag("h", "help", "Print this help menu");
             let matches = match opts.parse(&args[2..]) {
@@ -395,6 +400,7 @@ pub fn main() {
                         .collect();
                     topaz_tak::analyze_tei::TeiEngineConfig { command, name, options }
                 }),
+                reverse: matches.opt_present("reverse"),
             };
             if let Err(e) = topaz_tak::analyze_game::run(cfg) {
                 eprintln!("analyzegame: {e}");
