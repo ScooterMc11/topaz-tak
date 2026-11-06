@@ -13,7 +13,7 @@
 //! teinewgame <size>          clears the engine's table and histories, so every position is
 //! position tps <tps>         searched from scratch and the sheet is a pure function of the game
 //! isready / readyok
-//! go nodes <n>
+//! go nodes <n>            or `go nodes <n·f> softnodes <n>` under --engine-hard-factor
 //! info … (one line per multi-PV index at the end of every completed depth)
 //! bestmove …
 //! ```
@@ -72,6 +72,11 @@ pub struct TeiEngineConfig {
     /// `HumanWDL true`, for instance. Applied after the defaults and before the game's own settings,
     /// so they can tune the engine but not change the game it is analyzing.
     pub options: Vec<(String, String)>,
+    /// `--engine-hard-factor`: when set, the node budget goes out as the engine's **soft** limit,
+    /// under a hard one this many times larger — `go nodes <n·f> softnodes <n>` — which is how topaz
+    /// spends its own budget (4x, `set_max_nodes`). Left unset, the budget is a hard stop, which a
+    /// TEI engine checks node by node and so ends exactly on, partway through its last depth.
+    pub hard_factor: Option<u64>,
 }
 
 /// An option the engine announced, as far as this module needs to know it.
@@ -88,6 +93,7 @@ pub struct TeiSearch {
     id: String,
     size: usize,
     nodes: u64,
+    hard_factor: Option<u64>,
     /// The `MultiPV` the engine currently has, so it is only re-sent when it changes.
     multi_pv: usize,
     line: String,
@@ -123,6 +129,7 @@ impl TeiSearch {
             id: cfg.name.clone(),
             size,
             nodes,
+            hard_factor: cfg.hard_factor,
             multi_pv: 1,
             line: String::new(),
             keep_table: false,
@@ -443,7 +450,7 @@ impl<B: TakBoard> PositionSearch<B> for TeiSearch {
         self.send(&format!("position tps {:?}", board))?;
         self.send("isready")?;
         self.wait_for("readyok")?;
-        self.send(&format!("go nodes {}", self.nodes))?;
+        self.send(&go_command(self.nodes, self.hard_factor))?;
 
         let mut infos = Vec::new();
         loop {
@@ -469,9 +476,24 @@ impl<B: TakBoard> PositionSearch<B> for TeiSearch {
     }
 }
 
+/// The `go` for one search: a hard stop at the budget, or with a hard factor the budget as
+/// `softnodes` under a hard limit that many times larger (`TeiEngineConfig::hard_factor`).
+fn go_command(nodes: u64, hard_factor: Option<u64>) -> String {
+    match hard_factor {
+        Some(f) => format!("go nodes {} softnodes {nodes}", nodes.saturating_mul(f)),
+        None => format!("go nodes {nodes}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_command_sends_a_soft_budget_under_a_hard_factor() {
+        assert_eq!(go_command(350_000, None), "go nodes 350000");
+        assert_eq!(go_command(250_000, Some(4)), "go nodes 1000000 softnodes 250000");
+    }
     use crate::board::Board6;
     use crate::Position;
 

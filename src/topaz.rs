@@ -305,6 +305,12 @@ pub fn main() {
                 "A setoption for the --engine-cmd engine, e.g. HumanWDL=true (repeatable)",
                 "NAME=VALUE",
             );
+            opts.optopt(
+                "",
+                "engine-hard-factor",
+                "Send the --nodes budget to the --engine-cmd engine as softnodes, under a hard limit this                  many times larger (default: the budget is a hard stop)",
+                "N",
+            );
             opts.optflag(
                 "",
                 "reverse",
@@ -398,7 +404,14 @@ pub fn main() {
                             }
                         })
                         .collect();
-                    topaz_tak::analyze_tei::TeiEngineConfig { command, name, options }
+                    let hard_factor = matches.opt_str("engine-hard-factor").map(|f| match f.parse::<u64>() {
+                        Ok(f) if f >= 1 => f,
+                        _ => {
+                            eprintln!("analyzegame: --engine-hard-factor wants a whole number >= 1, got '{f}'");
+                            std::process::exit(1);
+                        }
+                    });
+                    topaz_tak::analyze_tei::TeiEngineConfig { command, name, options, hard_factor }
                 }),
                 reverse: matches.opt_present("reverse"),
             };
